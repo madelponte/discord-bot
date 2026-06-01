@@ -19,8 +19,8 @@ services:
   #     - llm-net
 
   # ── Discord bot ────────────────────────────────────────────
-  pasta-bot:
-    container_name: pasta-bot
+  discord-bot:
+    container_name: discord-bot
     image: ghcr.io/madelponte/discord-bot:latest
     restart: unless-stopped
     env_file:
