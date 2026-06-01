@@ -1,0 +1,28 @@
+services:
+  # ── Your llama.cpp server ──────────────────────────────────
+  # Uncomment and adjust if you want compose to manage it too.
+  # If you already run llama-server separately, just make sure
+  # it's on the same Docker network (see below).
+  #
+  # llama-server:
+  #   image: ghcr.io/ggerganov/llama.cpp:server
+  #   command: >
+  #     --model /models/your-model.gguf
+  #     --host 0.0.0.0
+  #     --port 8080
+  #     --ctx-size 4096
+  #   volumes:
+  #     - /path/to/your/models:/models
+  #   ports:
+  #     - "8080:8080"
+  #   networks:
+  #     - llm-net
+
+  # ── Discord bot ────────────────────────────────────────────
+  pasta-bot:
+    container_name: pasta-bot
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+
