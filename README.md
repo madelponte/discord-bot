@@ -1,2 +1,110 @@
 # discord-bot
-Simple discord bot that hooks up to an OpenAI compatible api and responds to users with an LLM output
+
+A small, self-hosted Discord bot that bridges a Discord server to any
+**OpenAI-compatible chat-completions API** (e.g. [llama.cpp]'s `llama-server`,
+Ollama, vLLM, LM Studio, or OpenAI itself). Mention the bot in a channel and it
+forwards your message to the configured LLM and replies with the model's output.
+
+It is intentionally minimal — one [`bot.py`](bot.py), two dependencies, and a
+container image — so it's easy to read, audit, and run anywhere Docker runs.
+
+[llama.cpp]: https://github.com/ggml-org/llama.cpp
+
+## How it works
+
+1. The bot logs in to Discord using the [discord.py] gateway client.
+2. It listens for messages and only acts when the bot is **@-mentioned**
+   (`on_message`). Its own messages are ignored to prevent loops.
+3. If an allow-list of server (guild) IDs is configured, messages from any other
+   server are ignored.
+4. The mention is stripped from the text to form the **prompt**, which is sent as
+   a `chat/completions` request to `API_BASE_URL` with a system prompt, the
+   configured model name, `max_tokens`, and `temperature`.
+5. While the model generates, the channel shows a typing indicator. The reply is
+   posted back; responses longer than Discord's 2000-character limit are split
+   into multiple messages automatically.
+
+HTTP calls use a single shared [aiohttp] session (created lazily, reused across
+requests) with a 120-second total timeout. Connection and API errors are caught
+and reported back to the channel as a short `⚠️` message instead of crashing.
+
+[discord.py]: https://github.com/Rapptz/discord.py
+[aiohttp]: https://github.com/aio-libs/aiohttp
+
+## Configuration
+
+All configuration is via environment variables. Copy
+[`.env.example`](.env.example) to `.env` and fill it in:
+
+| Variable            | Required | Default                                | Description |
+| ------------------- | :------: | -------------------------------------- | ----------- |
+| `DISCORD_TOKEN`     | ✅       | —                                      | Bot token from the [Discord Developer Portal]. The bot exits if this is unset. |
+| `API_BASE_URL`      |          | `http://llama-server:8080/v1`          | Base URL of the OpenAI-compatible API. `/chat/completions` is appended to it. |
+| `MODEL_NAME`        |          | `default`                              | Model name sent in the request body. |
+| `ALLOWED_GUILD_IDS` |          | *(empty = all servers)*                | Comma-separated Discord server IDs the bot is allowed to respond in. |
+| `SYSTEM_PROMPT`     |          | `You are a helpful assistant. …`       | System prompt prepended to every request. |
+| `MAX_TOKENS`        |          | `1024`                                 | Maximum tokens to generate per reply. |
+
+> **Note:** if `ALLOWED_GUILD_IDS` is left empty the bot will respond in **every**
+> server it has been added to. Set it to lock the bot to specific servers.
+
+### Discord setup
+
+1. Create an application and bot at the [Discord Developer Portal].
+2. Under **Bot → Privileged Gateway Intents**, enable **Message Content Intent**
+   (the bot needs to read message text to build the prompt).
+3. Invite the bot to your server with the *Send Messages* and *Read Message
+   History* permissions.
+4. In a channel, mention it: `@YourBot what's the capital of France?`
+
+[Discord Developer Portal]: https://discord.com/developers/applications
+
+## Running
+
+### With Docker Compose (recommended)
+
+```bash
+cp .env.example .env   # then edit .env
+docker compose up -d --build
+docker compose logs -f
+```
+
+The bundled [`compose.yml`](compose.yml) runs the bot and reads `.env`. It also
+includes a commented-out `llama-server` service you can enable to have Compose
+manage your LLM backend on the same network — in that case keep the default
+`API_BASE_URL` of `http://llama-server:8080/v1`.
+
+### With the prebuilt image
+
+Images are published to the GitHub Container Registry on every push to `main`
+(see below):
+
+```bash
+docker run -d --env-file .env ghcr.io/madelponte/discord-bot:latest
+```
+
+### Locally (without Docker)
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+export $(grep -v '^#' .env | xargs)   # or set the variables yourself
+python -u bot.py
+```
+
+## Requirements
+
+- **Python 3.14** (the container is based on `python:3.14-slim`; 3.10+ works locally)
+- [`discord.py`](requirements.txt) `2.7.1`
+- [`aiohttp`](requirements.txt) `3.14.0`
+
+## Continuous delivery
+
+The [build-and-publish workflow](.github/workflows/docker-publish.yml) builds the
+container and pushes it to `ghcr.io/madelponte/discord-bot` on every push to
+`main` (tagged `latest` and with the commit SHA). No secrets to configure — it
+authenticates with the repository's built-in `GITHUB_TOKEN`.
+
+## License
+
+[MIT](LICENSE)

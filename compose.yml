@@ -21,7 +21,7 @@ services:
   # ── Discord bot ────────────────────────────────────────────
   pasta-bot:
     container_name: pasta-bot
-    build: .
+    image: ghcr.io/madelponte/mcp-server:latest
     restart: unless-stopped
     env_file:
       - .env
