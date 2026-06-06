@@ -1,6 +1,8 @@
+import asyncio
 import logging
 import os
 import re
+import signal
 import sys
 import traceback
 
@@ -123,6 +125,18 @@ async def on_ready():
 
 
 @bot.event
+async def on_disconnect():
+    # Fired whenever the gateway connection drops. discord.py reconnects
+    # automatically on transient blips; this just makes outages visible.
+    log.warning("⚠️  Disconnected from Discord gateway — attempting to reconnect…")
+
+
+@bot.event
+async def on_resumed():
+    log.info("🔄 Reconnected and resumed Discord session.")
+
+
+@bot.event
 async def on_message(message: discord.Message):
     # Ignore messages from the bot itself
     if message.author == bot.user:
@@ -169,15 +183,91 @@ async def on_message(message: discord.Message):
                 await message.channel.send(chunk)
 
 
-@bot.event
-async def on_close():
-    """Clean up the shared HTTP session when the bot shuts down."""
+async def _close_http_session() -> None:
+    """Close the shared aiohttp session, if it's open."""
     if _http_session and not _http_session.closed:
         await _http_session.close()
         log.info("HTTP session closed.")
 
 
+async def run_supervised() -> None:
+    """Run the bot, restarting it automatically if the connection is lost.
+
+    discord.py already reconnects internally on transient gateway hiccups
+    (see Client.connect). But during a real network/DNS outage — e.g.
+    "Temporary failure in name resolution" right after the container starts —
+    its internal reconnect can raise out of ``bot.start()`` and kill the
+    process. This outer loop is the safety net: on any such failure we wait
+    (exponential backoff) and start over, instead of exiting.
+
+    Genuine misconfiguration (bad token, missing privileged intents) is
+    treated as fatal — retrying those would just spin forever.
+    """
+    BASE_DELAY = 1.0      # first retry waits ~1s
+    MAX_DELAY = 300.0     # …capped at 5 minutes
+    STABLE_AFTER = 60.0   # a connection lasting this long resets the backoff
+    delay = BASE_DELAY
+
+    # Flip a flag on SIGINT/SIGTERM so Ctrl-C / `docker stop` shut us down
+    # cleanly instead of fighting the restart loop.
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            pass  # add_signal_handler isn't available on some platforms (Windows)
+
+    try:
+        first_attempt = True
+        while not stop.is_set():
+            started_at = loop.time()
+            try:
+                async with bot:
+                    if not first_attempt:
+                        # Re-arm a previously-closed Bot instance so is_closed()
+                        # is False and connect() will actually run again.
+                        bot.clear()
+                    await bot.start(DISCORD_TOKEN)
+            except (discord.LoginFailure, discord.PrivilegedIntentsRequired) as e:
+                log.fatal("Fatal startup error (not retrying): %s", e)
+                break
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                log.exception("Bot stopped with an exception.")
+            else:
+                log.info("Bot closed cleanly.")
+                break
+            finally:
+                first_attempt = False
+
+            if stop.is_set():
+                break
+
+            # If we'd been connected for a while, treat this as a fresh outage
+            # and restart the backoff from the bottom.
+            if loop.time() - started_at >= STABLE_AFTER:
+                delay = BASE_DELAY
+
+            log.warning("Restarting bot in %.1fs…", delay)
+            try:
+                # Sleep, but wake immediately if asked to shut down.
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            delay = min(delay * 2, MAX_DELAY)
+    finally:
+        if not bot.is_closed():
+            await bot.close()
+        await _close_http_session()
+        log.info("Shutdown complete.")
+
+
 # ── Entry point ──────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("Starting bot...")
-    bot.run(DISCORD_TOKEN, log_handler=None)  # log_handler=None since we set up our own
+    try:
+        asyncio.run(run_supervised())
+    except KeyboardInterrupt:
+        log.info("Interrupted — exiting.")
