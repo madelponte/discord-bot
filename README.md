@@ -17,10 +17,18 @@ container image — so it's easy to read, audit, and run anywhere Docker runs.
    (`on_message`). Its own messages are ignored to prevent loops.
 3. If an allow-list of server (guild) IDs is configured, messages from any other
    server are ignored.
-4. The mention is stripped from the text to form the **prompt**, which is sent as
-   a `chat/completions` request to `API_BASE_URL` with a system prompt, the
-   configured model name, `max_tokens`, and `temperature`.
-5. While the model generates, the channel shows a typing indicator. The reply is
+4. The bot's own mention is removed from the text to form the **prompt**; any
+   other mentions (users, roles, channels) are resolved to readable display
+   names so the model sees "Alice" rather than a raw ID. For context, the bot
+   also reads back over the channel's most recent messages (up to
+   `MAX_CONTEXT_MESSAGES`) — each prior message becomes a turn (the bot's own as
+   the assistant, others prefixed with the speaker's name) so it can see what's
+   recently been going on, with the triggering message as the final prompt.
+5. The conversation is sent as a `chat/completions` request to `API_BASE_URL`
+   with a system prompt, the configured model name, `max_tokens`, and
+   `temperature`. A per-user cooldown (`USER_COOLDOWN_SECONDS`) stops a single
+   user from hammering the bot.
+6. While the model generates, the channel shows a typing indicator. The reply is
    posted back; responses longer than Discord's 2000-character limit are split
    into multiple messages automatically.
 
@@ -44,6 +52,8 @@ All configuration is via environment variables. Copy
 | `ALLOWED_GUILD_IDS` |          | *(empty = all servers)*                | Comma-separated Discord server IDs the bot is allowed to respond in. |
 | `SYSTEM_PROMPT`     |          | `You are a helpful assistant. …`       | System prompt prepended to every request. |
 | `MAX_TOKENS`        |          | `1024`                                 | Maximum tokens to generate per reply. |
+| `MAX_CONTEXT_MESSAGES` |       | `6`                                    | How many of the channel's most recent messages to include as context (counting the triggering message). `1` = one-shot, no context. |
+| `USER_COOLDOWN_SECONDS` |      | `5`                                    | Minimum seconds between requests from the same user. `0` disables the cooldown. |
 
 > **Note:** if `ALLOWED_GUILD_IDS` is left empty the bot will respond in **every**
 > server it has been added to. Set it to lock the bot to specific servers.
@@ -98,12 +108,6 @@ python -u bot.py
 - [`discord.py`](requirements.txt) `2.7.1`
 - [`aiohttp`](requirements.txt) `3.14.0`
 
-## Continuous delivery
-
-The [build-and-publish workflow](.github/workflows/docker-publish.yml) builds the
-container and pushes it to `ghcr.io/madelponte/discord-bot` on every push to
-`main` (tagged `latest` and with the commit SHA). No secrets to configure — it
-authenticates with the repository's built-in `GITHUB_TOKEN`.
 
 ## License
 
