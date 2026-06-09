@@ -19,9 +19,11 @@ container image — so it's easy to read, audit, and run anywhere Docker runs.
    server are ignored.
 4. The bot's own mention is removed from the text to form the **prompt**; any
    other mentions (users, roles, channels) are resolved to readable display
-   names so the model sees "Alice" rather than a raw ID. If the message is a
-   reply to one of the bot's messages, it walks the reply chain (up to
-   `MAX_CONTEXT_MESSAGES`) to build a short multi-turn conversation.
+   names so the model sees "Alice" rather than a raw ID. For context, the bot
+   also reads back over the channel's most recent messages (up to
+   `MAX_CONTEXT_MESSAGES`) — each prior message becomes a turn (the bot's own as
+   the assistant, others prefixed with the speaker's name) so it can see what's
+   recently been going on, with the triggering message as the final prompt.
 5. The conversation is sent as a `chat/completions` request to `API_BASE_URL`
    with a system prompt, the configured model name, `max_tokens`, and
    `temperature`. A per-user cooldown (`USER_COOLDOWN_SECONDS`) stops a single
@@ -50,7 +52,7 @@ All configuration is via environment variables. Copy
 | `ALLOWED_GUILD_IDS` |          | *(empty = all servers)*                | Comma-separated Discord server IDs the bot is allowed to respond in. |
 | `SYSTEM_PROMPT`     |          | `You are a helpful assistant. …`       | System prompt prepended to every request. |
 | `MAX_TOKENS`        |          | `1024`                                 | Maximum tokens to generate per reply. |
-| `MAX_CONTEXT_MESSAGES` |       | `6`                                    | How many reply-chain messages to include as context (counting the triggering message). `1` = one-shot, no memory. |
+| `MAX_CONTEXT_MESSAGES` |       | `6`                                    | How many of the channel's most recent messages to include as context (counting the triggering message). `1` = one-shot, no context. |
 | `USER_COOLDOWN_SECONDS` |      | `5`                                    | Minimum seconds between requests from the same user. `0` disables the cooldown. |
 
 > **Note:** if `ALLOWED_GUILD_IDS` is left empty the bot will respond in **every**

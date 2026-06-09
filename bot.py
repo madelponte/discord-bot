@@ -58,8 +58,8 @@ SYSTEM_PROMPT = os.environ.get(
     "You are a helpful assistant. Keep responses concise and under 2000 characters.",
 )
 MAX_TOKENS = _int_env("MAX_TOKENS", 1024)
-# How many messages of reply-chain history to include (counting the triggering
-# message). 1 reproduces the old one-shot behaviour.
+# How many of the channel's most recent messages to include as context
+# (counting the triggering message). 1 means one-shot, no surrounding context.
 MAX_CONTEXT_MESSAGES = max(1, _int_env("MAX_CONTEXT_MESSAGES", 6))
 # Minimum seconds between requests from the same user. 0 disables the cooldown.
 USER_COOLDOWN_SECONDS = max(0, _int_env("USER_COOLDOWN_SECONDS", 5))
@@ -176,43 +176,48 @@ def clean_message_content(message: discord.Message, bot_user: discord.ClientUser
     return content.strip()
 
 
-async def build_message_chain(
+async def build_context_messages(
     message: discord.Message,
     bot_user: discord.ClientUser,
     max_messages: int,
 ) -> list[dict]:
-    """Walk the reply chain to build a multi-turn ``messages`` array.
+    """Build a multi-turn ``messages`` array from the channel's recent history.
 
-    Starting from ``message`` we follow ``Message.reference`` up to its parent,
-    classifying each as an assistant turn (if it's the bot's) or a user turn,
-    until we run out of replies or hit ``max_messages``. The result is returned
+    Rather than following the reply chain, we include the ``max_messages`` most
+    recent messages in the channel so the model sees what's recently been going
+    on — not just the thread that was replied to. The messages immediately
+    preceding the trigger become the context (each classified as an assistant
+    turn for the bot's own messages, or a user turn prefixed with the author's
+    display name so the model can tell participants apart), and the triggering
+    message is always appended as the final, plain user turn. The result is
     oldest-first, ready to hand to the chat-completions API.
     """
-    chain: list[dict] = []  # newest-first while building
-    current: discord.Message | None = message
+    context: list[dict] = []
 
-    while current is not None and len(chain) < max_messages:
-        role = "assistant" if current.author.id == bot_user.id else "user"
-        content = clean_message_content(current, bot_user)
-        if content:
-            chain.append({"role": role, "content": content})
+    # Pull the messages just before the trigger for channel context. (max=1
+    # means no history — just the triggering message, i.e. one-shot.)
+    if max_messages > 1:
+        try:
+            recent = [m async for m in message.channel.history(limit=max_messages - 1, before=message)]
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning("Could not read channel history: %s", e)
+            recent = []
+        for msg in reversed(recent):  # history is newest-first -> walk oldest-first
+            content = clean_message_content(msg, bot_user)
+            if not content:
+                continue
+            if msg.author.id == bot_user.id:
+                context.append({"role": "assistant", "content": content})
+            else:
+                name = getattr(msg.author, "display_name", msg.author.name)
+                context.append({"role": "user", "content": f"{name}: {content}"})
 
-        ref = current.reference
-        if ref is None or ref.message_id is None:
-            break
+    # The triggering message is always the final user turn (the actual prompt).
+    prompt = clean_message_content(message, bot_user)
+    if prompt:
+        context.append({"role": "user", "content": prompt})
 
-        # Prefer the already-cached message; otherwise fetch it.
-        parent = ref.resolved if isinstance(ref.resolved, discord.Message) else None
-        if parent is None:
-            try:
-                parent = await current.channel.fetch_message(ref.message_id)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-                log.warning("Could not fetch referenced message %s: %s", ref.message_id, e)
-                parent = None
-        current = parent
-
-    chain.reverse()
-    return chain
+    return context
 
 
 def create_bot() -> commands.Bot:
@@ -293,8 +298,8 @@ def create_bot() -> commands.Bot:
                 return
             _last_request[message.author.id] = now
 
-        # Build a short multi-turn context by walking the reply chain.
-        messages = await build_message_chain(message, bot.user, MAX_CONTEXT_MESSAGES)
+        # Build context from the most recent messages in this channel.
+        messages = await build_context_messages(message, bot.user, MAX_CONTEXT_MESSAGES)
         log.info("Prompt: %s  (context: %d message(s))", prompt[:120], len(messages))
 
         # Show typing indicator while generating
