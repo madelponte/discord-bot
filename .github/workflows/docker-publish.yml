@@ -1,11 +1,20 @@
 name: Build and publish container
 
 # Build the bot image and push it to the GitHub Container Registry (GHCR)
-# whenever new code lands on main. Also runnable manually from the Actions tab.
+# whenever new code lands on main. Pull requests that target main are also
+# built (and pushed, tagged pr-<number>) so changes can be tested before
+# merge. Also runnable manually from the Actions tab.
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
+
+# Avoid redundant builds: a new push to a branch/PR cancels its in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
@@ -14,6 +23,12 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    # Build pushes to main and same-repo pull requests only. PRs opened from a
+    # fork run with a read-only token and no package write access, so building
+    # them would just fail — skip them rather than auto-build untrusted code.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
       packages: write   # required to push to GHCR with GITHUB_TOKEN
@@ -37,9 +52,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # On push to main: tag `latest` + `sha-<commit>`.
+          # On a pull request: tag `pr-<number>` only (never moves `latest`).
           tags: |
-            type=raw,value=latest
-            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long,enable=${{ github.event_name != 'pull_request' }}
+            type=ref,event=pr
 
       - name: Build and push image
         uses: docker/build-push-action@v6

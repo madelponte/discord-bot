@@ -106,12 +106,6 @@ python -u bot.py
 - [`discord.py`](requirements.txt) `2.7.1`
 - [`aiohttp`](requirements.txt) `3.14.0`
 
-## Continuous delivery
-
-The [build-and-publish workflow](.github/workflows/docker-publish.yml) builds the
-container and pushes it to `ghcr.io/madelponte/discord-bot` on every push to
-`main` (tagged `latest` and with the commit SHA). No secrets to configure — it
-authenticates with the repository's built-in `GITHUB_TOKEN`.
 
 ## License
 
