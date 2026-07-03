@@ -13,7 +13,7 @@ container image — so it's easy to read, audit, and run anywhere Docker runs.
 ## How it works
 
 1. The bot logs in to Discord using the [discord.py] gateway client.
-2. It listens for messages and only acts when the bot is **@-mentioned**
+2. It listens for messages with a lean `discord.Client` and only acts when the bot is **@-mentioned**
    (`on_message`). Its own messages are ignored to prevent loops.
 3. If an allow-list of server (guild) IDs is configured, messages from any other
    server are ignored.
@@ -106,7 +106,7 @@ python -u bot.py
 
 - **Python 3.14** (the container is based on `python:3.14-slim`; 3.10+ works locally)
 - [`discord.py`](requirements.txt) `2.7.1`
-- [`aiohttp`](requirements.txt) `3.14.0`
+- [`aiohttp`](requirements.txt) `3.14.1`
 
 
 ## License
