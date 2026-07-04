@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import re
 import signal
 import sys
 import time
@@ -9,7 +8,6 @@ import traceback
 
 import aiohttp
 import discord
-from discord.ext import commands
 
 # --- Logging setup ---
 logging.basicConfig(
@@ -57,12 +55,14 @@ SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
     "You are a helpful assistant. Keep responses concise and under 2000 characters.",
 )
-MAX_TOKENS = _int_env("MAX_TOKENS", 1024)
+MAX_TOKENS = max(1, _int_env("MAX_TOKENS", 1024))
 # How many of the channel's most recent messages to include as context
 # (counting the triggering message). 1 means one-shot, no surrounding context.
 MAX_CONTEXT_MESSAGES = max(1, _int_env("MAX_CONTEXT_MESSAGES", 6))
 # Minimum seconds between requests from the same user. 0 disables the cooldown.
 USER_COOLDOWN_SECONDS = max(0, _int_env("USER_COOLDOWN_SECONDS", 5))
+DISCORD_MESSAGE_LIMIT = 2000
+API_TIMEOUT_SECONDS = 120
 
 # Parse allowed guild IDs into a set of ints. A typo here should produce a
 # readable fatal error, not a raw ValueError traceback at import time.
@@ -107,7 +107,7 @@ async def get_http_session() -> aiohttp.ClientSession:
     global _http_session
     if _http_session is None or _http_session.closed:
         _http_session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=120),
+            timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS),
         )
     return _http_session
 
@@ -135,8 +135,15 @@ async def query_llm(messages: list[dict]) -> str:
                 error_text = await resp.text()
                 log.error("API error body: %s", error_text[:500])
                 return f"⚠️ API error ({resp.status}): {error_text[:200]}"
-            data = await resp.json()
-            reply = data["choices"][0]["message"]["content"]
+            data = await resp.json(content_type=None)
+            try:
+                reply = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError):
+                log.error("Unexpected API response shape: %r", data)
+                return "⚠️ The LLM server returned an unexpected response."
+            if not isinstance(reply, str) or not reply.strip():
+                log.error("LLM response was empty or non-text: %r", reply)
+                return "⚠️ The LLM server returned an empty response."
             log.info("LLM reply: %d chars", len(reply))
             return reply
     except aiohttp.ClientConnectorError as e:
@@ -158,7 +165,7 @@ def clean_message_content(message: discord.Message, bot_user: discord.ClientUser
     content = message.content
 
     # Remove the bot's own mention (both the <@id> and legacy <@!id> forms).
-    content = re.sub(rf"<@!?{bot_user.id}>", "", content)
+    content = content.replace(f"<@{bot_user.id}>", "").replace(f"<@!{bot_user.id}>", "")
 
     # Resolve user mentions to display names.
     for user in message.mentions:
@@ -174,6 +181,50 @@ def clean_message_content(message: discord.Message, bot_user: discord.ClientUser
         content = content.replace(f"<#{channel.id}>", f"#{channel.name}")
 
     return content.strip()
+
+
+def split_discord_message(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
+    """Split a Discord response without exceeding the message length limit."""
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit)
+        if split_at < limit // 2:
+            split_at = remaining.rfind(" ", 0, limit)
+        if split_at < limit // 2:
+            split_at = limit
+
+        chunk = remaining[:split_at].rstrip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip()
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def record_user_request(user_id: int, now: float) -> float | None:
+    """Record a request and return remaining cooldown seconds if blocked."""
+    if USER_COOLDOWN_SECONDS <= 0:
+        return None
+
+    cutoff = now - USER_COOLDOWN_SECONDS
+    stale_user_ids = [uid for uid, last_seen in _last_request.items() if last_seen < cutoff]
+    for uid in stale_user_ids:
+        del _last_request[uid]
+
+    last = _last_request.get(user_id)
+    if last is not None:
+        remaining = USER_COOLDOWN_SECONDS - (now - last)
+        if remaining > 0:
+            return remaining
+
+    _last_request[user_id] = now
+    return None
 
 
 async def build_context_messages(
@@ -220,8 +271,8 @@ async def build_context_messages(
     return context
 
 
-def create_bot() -> commands.Bot:
-    """Construct a fresh Bot with its event handlers registered.
+def create_bot() -> discord.Client:
+    """Construct a fresh Discord client with its event handlers registered.
 
     The supervised loop calls this each iteration so every reconnect gets a
     brand-new client. That sidesteps re-arming a closed Bot via ``bot.clear()``,
@@ -235,11 +286,11 @@ def create_bot() -> commands.Bot:
     intents.message_content = True # needed to read the prompt text
     intents.messages = True        # needed to receive message events
 
-    bot = commands.Bot(command_prefix="!", intents=intents)
+    client = discord.Client(intents=intents)
 
-    @bot.event
+    @client.event
     async def on_ready():
-        log.info("✅ Logged in as %s (ID: %s)", bot.user, bot.user.id)
+        log.info("✅ Logged in as %s (ID: %s)", client.user, client.user.id if client.user else "unknown")
         if allowed_guilds:
             log.info("🔒 Restricted to guild IDs: %s", allowed_guilds)
         else:
@@ -247,24 +298,27 @@ def create_bot() -> commands.Bot:
         log.info("🔗 API endpoint: %s", API_BASE_URL)
         log.info("🤖 Model: %s", MODEL_NAME)
 
-    @bot.event
+    @client.event
     async def on_disconnect():
         # Fired whenever the gateway connection drops. discord.py reconnects
         # automatically on transient blips; this just makes outages visible.
         log.warning("⚠️  Disconnected from Discord gateway — attempting to reconnect…")
 
-    @bot.event
+    @client.event
     async def on_resumed():
         log.info("🔄 Reconnected and resumed Discord session.")
 
-    @bot.event
+    @client.event
     async def on_message(message: discord.Message):
+        if client.user is None:
+            return
+
         # Ignore messages from the bot itself
-        if message.author == bot.user:
+        if message.author == client.user:
             return
 
         # Only respond when the bot is mentioned
-        if bot.user not in message.mentions:
+        if client.user not in message.mentions:
             return
 
         log.info(
@@ -279,45 +333,36 @@ def create_bot() -> commands.Bot:
             log.info("Ignoring — guild not in allow list")
             return
 
-        prompt = clean_message_content(message, bot.user)
+        prompt = clean_message_content(message, client.user)
         if not prompt:
             await message.reply("You mentioned me but didn't ask anything! Try: `@BotName your question here`")
             return
 
         # Per-user cooldown so one person can't hammer the bot.
-        if USER_COOLDOWN_SECONDS > 0:
-            now = time.monotonic()
-            last = _last_request.get(message.author.id)
-            if last is not None and now - last < USER_COOLDOWN_SECONDS:
-                remaining = USER_COOLDOWN_SECONDS - (now - last)
-                log.info("User %s on cooldown (%.1fs left) — ignoring", message.author, remaining)
-                try:
-                    await message.add_reaction("🕒")
-                except discord.HTTPException:
-                    pass
-                return
-            _last_request[message.author.id] = now
+        remaining = record_user_request(message.author.id, time.monotonic())
+        if remaining is not None:
+            log.info("User %s on cooldown (%.1fs left) — ignoring", message.author, remaining)
+            try:
+                await message.add_reaction("🕒")
+            except discord.HTTPException:
+                pass
+            return
 
         # Build context from the most recent messages in this channel.
-        messages = await build_context_messages(message, bot.user, MAX_CONTEXT_MESSAGES)
+        messages = await build_context_messages(message, client.user, MAX_CONTEXT_MESSAGES)
         log.info("Prompt: %s  (context: %d message(s))", prompt[:120], len(messages))
 
         # Show typing indicator while generating
         async with message.channel.typing():
             response = await query_llm(messages)
 
-        # Discord has a 2000-char limit; split if needed
-        if len(response) <= 2000:
-            await message.reply(response)
-        else:
-            chunks = [response[i : i + 1990] for i in range(0, len(response), 1990)]
-            for i, chunk in enumerate(chunks):
-                if i == 0:
-                    await message.reply(chunk)
-                else:
-                    await message.channel.send(chunk)
+        for i, chunk in enumerate(split_discord_message(response)):
+            if i == 0:
+                await message.reply(chunk)
+            else:
+                await message.channel.send(chunk)
 
-    return bot
+    return client
 
 
 async def _close_http_session() -> None:
@@ -359,7 +404,7 @@ async def run_supervised() -> None:
         except NotImplementedError:
             pass  # add_signal_handler isn't available on some platforms (Windows)
 
-    bot: commands.Bot | None = None
+    bot: discord.Client | None = None
     try:
         while not stop.is_set():
             started_at = loop.time()
