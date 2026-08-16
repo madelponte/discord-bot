@@ -1,0 +1,18 @@
+# Version control and local development
+.git
+.venv
+__pycache__/
+*.pyc
+
+# Secrets — never send to the build daemon
+.env*
+
+# Not needed to build the image
+.github/
+tests/
+.coveragerc
+requirements-dev.txt
+*.md
+LICENSE
+Dockerfile
+compose.yml

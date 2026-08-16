@@ -134,7 +134,7 @@ async def query_llm(messages: list[dict]) -> str:
             if resp.status != 200:
                 error_text = await resp.text()
                 log.error("API error body: %s", error_text[:500])
-                return f"⚠️ API error ({resp.status}): {error_text[:200]}"
+                return "⚠️ The LLM server returned an error."
             data = await resp.json(content_type=None)
             try:
                 reply = data["choices"][0]["message"]["content"]
@@ -148,10 +148,10 @@ async def query_llm(messages: list[dict]) -> str:
             return reply
     except aiohttp.ClientConnectorError as e:
         log.error("Cannot connect to LLM API at %s: %s", url, e)
-        return f"⚠️ Cannot reach the LLM server at `{url}`. Is it running?"
+        return "⚠️ Cannot reach the LLM server right now."
     except Exception as e:
         log.error("Unexpected error in query_llm: %s\n%s", e, traceback.format_exc())
-        return f"⚠️ Internal error: {type(e).__name__}: {e}"
+        return "⚠️ An unexpected error occurred while contacting the LLM server."
 
 
 def clean_message_content(message: discord.Message, bot_user: discord.ClientUser) -> str:
@@ -388,6 +388,9 @@ async def run_supervised() -> None:
 
     Genuine misconfiguration (bad token, missing privileged intents) is
     treated as fatal — retrying those would just spin forever.
+
+    SIGINT/SIGTERM close the running client immediately so shutdown
+    completes well inside a container's stop grace period.
     """
     BASE_DELAY = 1.0      # first retry waits ~1s
     MAX_DELAY = 300.0     # …capped at 5 minutes
@@ -398,13 +401,26 @@ async def run_supervised() -> None:
     # cleanly instead of fighting the restart loop.
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
+
+    bot: discord.Client | None = None
+
+    def _handle_stop() -> None:
+        # Setting the flag alone is not enough: it is only re-checked after
+        # bot.start() returns, and nothing else would make it return. Also
+        # close the client — that unwinds its connect loop and brings
+        # start() back, so we shut down within a fraction of a second
+        # instead of waiting for SIGKILL. Re-signalling is harmless: close()
+        # is idempotent and is_closed() becomes true as soon as it starts.
+        stop.set()
+        if bot is not None and not bot.is_closed():
+            asyncio.ensure_future(bot.close())
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, stop.set)
+            loop.add_signal_handler(sig, _handle_stop)
         except NotImplementedError:
             pass  # add_signal_handler isn't available on some platforms (Windows)
 
-    bot: discord.Client | None = None
     try:
         while not stop.is_set():
             started_at = loop.time()

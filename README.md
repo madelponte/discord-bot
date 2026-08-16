@@ -34,7 +34,9 @@ container image — so it's easy to read, audit, and run anywhere Docker runs.
 
 HTTP calls use a single shared [aiohttp] session (created lazily, reused across
 requests) with a 120-second total timeout. Connection and API errors are caught
-and reported back to the channel as a short `⚠️` message instead of crashing.
+and reported back to the channel as a generic `⚠️` message instead of crashing.
+Internal URLs, exception details, and API error bodies are logged server-side
+but are never included in Discord replies.
 
 [discord.py]: https://github.com/Rapptz/discord.py
 [aiohttp]: https://github.com/aio-libs/aiohttp
@@ -70,6 +72,9 @@ All configuration is via environment variables. Copy
 [Discord Developer Portal]: https://discord.com/developers/applications
 
 ## Running
+
+The container runs as the unprivileged `nobody` user and needs no extra
+privileges or writable mounts.
 
 ### With Docker Compose (recommended)
 
@@ -108,6 +113,21 @@ python -u bot.py
 - [`discord.py`](requirements.txt) `2.7.1`
 - [`aiohttp`](requirements.txt) `3.14.3`
 
+## Testing
+
+The test suite uses the standard-library `unittest` framework and mocks Discord
+and the LLM API, so it needs neither a real Discord token nor a running server.
+Install the development dependencies and run it with enforced 100% statement
+and branch coverage:
+
+```bash
+.venv/bin/python -m pip install -r requirements-dev.txt
+DISCORD_TOKEN=test .venv/bin/python -m coverage run -m unittest discover -s tests -v
+.venv/bin/python -m coverage report -m
+```
+
+The coverage threshold is configured in [`.coveragerc`](.coveragerc), and CI
+runs the suite on Python 3.10 and 3.14.
 
 ## License
 
