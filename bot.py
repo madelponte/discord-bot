@@ -49,6 +49,7 @@ if not DISCORD_TOKEN:
 # .env.example sets these keys to an empty string, so a user who leaves them
 # blank would get "" rather than the default — hence the `.strip() or default`.
 API_BASE_URL = os.environ.get("API_BASE_URL", "").strip() or "http://llama-server:8080/v1"
+API_KEY = os.environ.get("API_KEY", "").strip()
 MODEL_NAME = os.environ.get("MODEL_NAME", "").strip() or "default"
 ALLOWED_GUILD_IDS = os.environ.get("ALLOWED_GUILD_IDS", "")  # comma-separated
 SYSTEM_PROMPT = os.environ.get(
@@ -84,6 +85,7 @@ if ALLOWED_GUILD_IDS.strip():
 
 log.info("--- Configuration ---")
 log.info("API_BASE_URL         = %s", API_BASE_URL)
+log.info("API_AUTHENTICATION   = %s", "enabled" if API_KEY else "disabled")
 log.info("MODEL_NAME           = %s", MODEL_NAME)
 log.info("MAX_TOKENS           = %d", MAX_TOKENS)
 log.info("MAX_CONTEXT_MESSAGES = %d", MAX_CONTEXT_MESSAGES)
@@ -106,8 +108,10 @@ async def get_http_session() -> aiohttp.ClientSession:
     """Return the shared aiohttp session, creating it on first use."""
     global _http_session
     if _http_session is None or _http_session.closed:
+        headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else None
         _http_session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS),
+            headers=headers,
         )
     return _http_session
 
