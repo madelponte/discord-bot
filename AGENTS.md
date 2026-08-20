@@ -43,6 +43,7 @@ It is intended to work with OpenAI-compatible backends such as llama.cpp, Ollama
 
 - `DISCORD_TOKEN` — required; importing or starting the module exits if it is missing or empty.
 - `API_BASE_URL` — defaults to `http://llama-server:8080/v1` when absent or blank.
+- `API_KEY` — optional API key sent as a Bearer token; empty disables API authentication.
 - `MODEL_NAME` — defaults to `default` when absent or blank.
 - `ALLOWED_GUILD_IDS` — comma-separated integer guild IDs; empty permits all guilds. When an allow-list is set, direct messages are rejected.
 - `SYSTEM_PROMPT` — defaults to `You are a helpful assistant. Keep responses concise and under 2000 characters.` when the variable is absent. An explicitly blank value remains blank.

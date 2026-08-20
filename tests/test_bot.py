@@ -176,7 +176,10 @@ class HttpSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_http_session_creates_reuses_and_replaces_closed_session(self):
         first = SimpleNamespace(closed=False, close=AsyncMock())
         second = SimpleNamespace(closed=False, close=AsyncMock())
-        with patch.object(bot.aiohttp, "ClientSession", side_effect=[first, second]) as constructor:
+        with (
+            patch.object(bot, "API_KEY", "secret-key"),
+            patch.object(bot.aiohttp, "ClientSession", side_effect=[first, second]) as constructor,
+        ):
             self.assertIs(await bot.get_http_session(), first)
             self.assertIs(await bot.get_http_session(), first)
             first.closed = True
@@ -186,6 +189,19 @@ class HttpSessionTests(unittest.IsolatedAsyncioTestCase):
             constructor.call_args.kwargs["timeout"].total,
             bot.API_TIMEOUT_SECONDS,
         )
+        self.assertEqual(
+            constructor.call_args.kwargs["headers"],
+            {"Authorization": "Bearer secret-key"},
+        )
+
+    async def test_get_http_session_omits_auth_header_without_api_key(self):
+        session = SimpleNamespace(closed=False, close=AsyncMock())
+        with (
+            patch.object(bot, "API_KEY", ""),
+            patch.object(bot.aiohttp, "ClientSession", return_value=session) as constructor,
+        ):
+            self.assertIs(await bot.get_http_session(), session)
+        self.assertIsNone(constructor.call_args.kwargs["headers"])
 
     async def test_close_http_session_handles_none_closed_and_open(self):
         await bot._close_http_session()

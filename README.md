@@ -26,8 +26,9 @@ container image — so it's easy to read, audit, and run anywhere Docker runs.
    recently been going on, with the triggering message as the final prompt.
 5. The conversation is sent as a `chat/completions` request to `API_BASE_URL`
    with a system prompt, the configured model name, `max_tokens`, and
-   `temperature`. A per-user cooldown (`USER_COOLDOWN_SECONDS`) stops a single
-   user from hammering the bot.
+   `temperature`. If `API_KEY` is configured, it is sent as an
+   `Authorization: Bearer …` header. A per-user cooldown
+   (`USER_COOLDOWN_SECONDS`) stops a single user from hammering the bot.
 6. While the model generates, the channel shows a typing indicator. The reply is
    posted back; responses longer than Discord's 2000-character limit are split
    into multiple messages automatically.
@@ -50,6 +51,7 @@ All configuration is via environment variables. Copy
 | ------------------- | :------: | -------------------------------------- | ----------- |
 | `DISCORD_TOKEN`     | ✅       | —                                      | Bot token from the [Discord Developer Portal]. The bot exits if this is unset. |
 | `API_BASE_URL`      |          | `http://llama-server:8080/v1`          | Base URL of the OpenAI-compatible API. `/chat/completions` is appended to it. |
+| `API_KEY`           |          | *(empty)*                              | API key sent as an `Authorization: Bearer <key>` header. Leave empty for unauthenticated servers. |
 | `MODEL_NAME`        |          | `default`                              | Model name sent in the request body. |
 | `ALLOWED_GUILD_IDS` |          | *(empty = all servers)*                | Comma-separated Discord server IDs the bot is allowed to respond in. |
 | `SYSTEM_PROMPT`     |          | `You are a helpful assistant. …`       | System prompt prepended to every request. |
@@ -59,6 +61,9 @@ All configuration is via environment variables. Copy
 
 > **Note:** if `ALLOWED_GUILD_IDS` is left empty the bot will respond in **every**
 > server it has been added to. Set it to lock the bot to specific servers.
+>
+> For a llama.cpp server started with `--api-key`, set `API_KEY` to the same
+> value. The key is never written to the bot's logs.
 
 ### Discord setup
 
