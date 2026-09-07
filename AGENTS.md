@@ -50,6 +50,7 @@ It is intended to work with OpenAI-compatible backends such as llama.cpp, Ollama
 - `MAX_TOKENS` — defaults to `1024` and is clamped to at least `1`.
 - `MAX_CONTEXT_MESSAGES` — defaults to `6` and is clamped to at least `1`; `1` disables history context.
 - `USER_COOLDOWN_SECONDS` — defaults to `5` and is clamped to at least `0`; `0` disables the cooldown.
+- `MAX_CONCURRENT_REQUESTS` — defaults to `1` and is clamped to at least `1`; limits active requests per process from history loading through reply delivery. Each user is limited to one active request. Busy requests are rejected without queuing or consuming cooldown.
 
 Non-integer values for the integer settings, or non-integer entries in `ALLOWED_GUILD_IDS`, cause a clean startup failure.
 
@@ -73,13 +74,13 @@ Key functions in `bot.py`:
 - `create_bot()` — configures Discord intents and event handlers.
 - `run_supervised()` — runs fresh Discord clients with exponential-backoff recovery and graceful signal handling.
 
-The shared HTTP session and cooldown map intentionally live at module scope so they persist across Discord client reconnections. Preserve fresh-client construction in the supervised reconnect loop; reusing a closed `discord.Client` is intentionally avoided.
+The shared HTTP session, cooldown map, and active-user set intentionally live at module scope so they persist across Discord client reconnections. Admission checks and reservation must not yield to the event loop; release active-user reservations in `finally`, including on cancellation. Preserve fresh-client construction in the supervised reconnect loop; reusing a closed `discord.Client` is intentionally avoided.
 
 ## Discord requirements
 
 The Discord application must have **Message Content Intent** enabled. The bot needs channel access and permission to send messages. **Read Message History** enables multi-turn context; history failures degrade to using only the triggering message. Adding the cooldown reaction may require **Add Reactions**, but reaction failures are intentionally ignored.
 
-The bot only responds when directly mentioned. If `ALLOWED_GUILD_IDS` is empty, it can respond in any guild where it has the necessary access. If the allow-list is nonempty, only listed guilds are accepted.
+The bot only responds when directly mentioned by a human user; messages from bots and webhooks are ignored. Client-wide `AllowedMentions.none()` suppresses all outgoing mention notifications, including reply-author pings. If `ALLOWED_GUILD_IDS` is empty, it can respond in any guild where it has the necessary access. If the allow-list is nonempty, only listed guilds are accepted.
 
 ## Development guidance
 

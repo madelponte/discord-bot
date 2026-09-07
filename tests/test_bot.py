@@ -68,9 +68,13 @@ class FakeMessage:
         channel_mentions=None,
         channel=None,
         guild=None,
+        webhook_id=None,
     ):
         self.content = content
+        # SimpleNamespace authors default to human users in these fixtures.
+        author.__dict__.setdefault("bot", False)
         self.author = author
+        self.webhook_id = webhook_id
         self.mentions = mentions or []
         self.role_mentions = role_mentions or []
         self.channel_mentions = channel_mentions or []
@@ -150,6 +154,19 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(namespace["MAX_TOKENS"], 1)
         self.assertEqual(namespace["MAX_CONTEXT_MESSAGES"], 1)
         self.assertEqual(namespace["USER_COOLDOWN_SECONDS"], 0)
+
+    def test_concurrency_configuration(self):
+        for raw, expected in ((None, 1), ("", 1), ("0", 1), ("-2", 1), ("3", 3)):
+            env = {"DISCORD_TOKEN": "test"}
+            if raw is not None:
+                env["MAX_CONCURRENT_REQUESTS"] = raw
+            with self.subTest(raw=raw), patch.dict(os.environ, env, clear=True):
+                namespace = runpy.run_path(bot.__file__, run_name="not_main")
+                self.assertEqual(namespace["MAX_CONCURRENT_REQUESTS"], expected)
+        with patch.dict(os.environ, {
+            "DISCORD_TOKEN": "test", "MAX_CONCURRENT_REQUESTS": "bad"
+        }, clear=True), self.assertRaises(SystemExit):
+            runpy.run_path(bot.__file__, run_name="not_main")
 
     def test_entry_point_runs_and_handles_keyboard_interrupt(self):
         env = {"DISCORD_TOKEN": "test"}
@@ -378,11 +395,36 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
 class ClientEventTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         bot._last_request.clear()
+        bot._active_users.clear()
+
+    def tearDown(self):
+        self.assertEqual(bot._active_users, set())
 
     def make_client(self, user=None):
         client = bot.create_bot()
         client._connection.user = user
         return client
+
+    async def test_mentions_are_disabled_for_every_fresh_client(self):
+        for _ in range(2):
+            client = self.make_client()
+            self.assertEqual(client.allowed_mentions.to_dict(), {"parse": []})
+            self.assertFalse(client.allowed_mentions.replied_user)
+
+    async def test_other_bots_and_webhooks_cannot_trigger_requests(self):
+        user = SimpleNamespace(id=1, name="Bot")
+        client = self.make_client(user)
+        with patch.object(bot, "query_llm", AsyncMock()) as query:
+            for is_bot, webhook_id in ((True, None), (True, 123), (False, 123)):
+                author = SimpleNamespace(id=2, name="Other", bot=is_bot)
+                message = FakeMessage(
+                    "<@1> hello", author, mentions=[user], webhook_id=webhook_id
+                )
+                await client.on_message(message)
+                message.reply.assert_not_awaited()
+                message.add_reaction.assert_not_awaited()
+            query.assert_not_awaited()
+        self.assertEqual(bot._last_request, {})
 
     async def test_lifecycle_events_and_ready_branches(self):
         user = SimpleNamespace(id=1, name="Bot")
@@ -469,6 +511,143 @@ class ClientEventTests(unittest.IsolatedAsyncioTestCase):
         query.assert_awaited_once_with(context)
         message.reply.assert_awaited_once_with("first")
         channel.send.assert_awaited_once_with("second")
+
+    async def test_global_limit_rejects_without_queue_or_cooldown_across_clients(self):
+        user = SimpleNamespace(id=1, name="Bot")
+        first = FakeMessage("<@1> first", SimpleNamespace(id=2), mentions=[user])
+        second = FakeMessage("<@1> second", SimpleNamespace(id=3), mentions=[user])
+        client = self.make_client(user)
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def generate(messages):
+            started.set()
+            await release.wait()
+            return "answer"
+
+        with (
+            patch.object(bot, "allowed_guilds", set()),
+            patch.object(bot, "MAX_CONCURRENT_REQUESTS", 1),
+            patch.object(bot, "USER_COOLDOWN_SECONDS", 5),
+            patch.object(bot, "MAX_CONTEXT_MESSAGES", 1),
+            patch.object(bot, "query_llm", AsyncMock(side_effect=generate)) as query,
+        ):
+            task = asyncio.create_task(client.on_message(first))
+            try:
+                await asyncio.wait_for(started.wait(), 1)
+                # A replacement client must share the existing request budget.
+                replacement = self.make_client(user)
+                await asyncio.wait_for(replacement.on_message(second), 1)
+                self.assertIn("busy", second.reply.call_args.args[0])
+                self.assertNotIn(3, bot._last_request)
+                self.assertEqual(query.await_count, 1)
+                self.assertEqual(bot._active_users, {2})
+            finally:
+                release.set()
+                await task
+            self.assertEqual(bot._active_users, set())
+            await replacement.on_message(second)
+            self.assertEqual(query.await_count, 2)
+
+    async def test_per_user_limit_with_cooldown_disabled_and_global_capacity_available(self):
+        user = SimpleNamespace(id=1, name="Bot")
+        author = SimpleNamespace(id=2)
+        first = FakeMessage("<@1> first", author, mentions=[user])
+        duplicate = FakeMessage("<@1> again", author, mentions=[user])
+        other = FakeMessage("<@1> other", SimpleNamespace(id=3), mentions=[user])
+        overflow = FakeMessage("<@1> overflow", SimpleNamespace(id=4), mentions=[user])
+        client = self.make_client(user)
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def generate(messages):
+            started.set()
+            await release.wait()
+            return "answer"
+
+        with (
+            patch.object(bot, "allowed_guilds", set()),
+            patch.object(bot, "MAX_CONCURRENT_REQUESTS", 2),
+            patch.object(bot, "USER_COOLDOWN_SECONDS", 0),
+            patch.object(bot, "MAX_CONTEXT_MESSAGES", 1),
+            patch.object(bot, "query_llm", AsyncMock(side_effect=generate)) as query,
+        ):
+            tasks = [asyncio.create_task(client.on_message(first))]
+            try:
+                await asyncio.wait_for(started.wait(), 1)
+                await asyncio.wait_for(client.on_message(duplicate), 1)
+                self.assertIn("busy", duplicate.reply.call_args.args[0])
+                self.assertEqual(query.await_count, 1)
+                started.clear()
+                tasks.append(asyncio.create_task(client.on_message(other)))
+                await asyncio.wait_for(started.wait(), 1)
+                self.assertEqual(bot._active_users, {2, 3})
+                await asyncio.wait_for(client.on_message(overflow), 1)
+                self.assertIn("busy", overflow.reply.call_args.args[0])
+                self.assertEqual(query.await_count, 2)
+            finally:
+                release.set()
+                await asyncio.gather(*tasks)
+
+    async def test_capacity_held_during_history_and_delivery_and_released_on_cancellation(self):
+        for stage in ("history", "query", "reply", "send"):
+            with self.subTest(stage=stage):
+                user = SimpleNamespace(id=1, name="Bot")
+                client = self.make_client(user)
+                message = FakeMessage("<@1> hello", SimpleNamespace(id=2), mentions=[user])
+                rejected = FakeMessage("<@1> hi", SimpleNamespace(id=3), mentions=[user])
+                started = asyncio.Event()
+
+                async def block(*args):
+                    started.set()
+                    await asyncio.Event().wait()
+
+                build = AsyncMock(return_value=[{"role": "user", "content": "hello"}])
+                query = AsyncMock(return_value="x" * 2001)
+                target = {"history": build, "query": query,
+                          "reply": message.reply, "send": message.channel.send}[stage]
+                target.side_effect = block
+                with (
+                    patch.object(bot, "allowed_guilds", set()),
+                    patch.object(bot, "MAX_CONCURRENT_REQUESTS", 1),
+                    patch.object(bot, "USER_COOLDOWN_SECONDS", 0),
+                    patch.object(bot, "build_context_messages", build),
+                    patch.object(bot, "query_llm", query),
+                ):
+                    task = asyncio.create_task(client.on_message(message))
+                    try:
+                        await asyncio.wait_for(started.wait(), 1)
+                        self.assertEqual(bot._active_users, {2})
+                        # Failed busy notifications must not disturb the active slot.
+                        rejected.reply.side_effect = discord.Forbidden(RawResponse(), "denied")
+                        await client.on_message(rejected)
+                        self.assertEqual(bot._active_users, {2})
+                    finally:
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                    self.assertEqual(bot._active_users, set())
+
+    async def test_capacity_released_on_history_api_and_delivery_failures(self):
+        for stage in ("history", "query", "reply", "send"):
+            with self.subTest(stage=stage):
+                user = SimpleNamespace(id=1, name="Bot")
+                client = self.make_client(user)
+                message = FakeMessage("<@1> hello", SimpleNamespace(id=2), mentions=[user])
+                build = AsyncMock(return_value=[{"role": "user", "content": "hello"}])
+                query = AsyncMock(return_value="x" * 2001)
+                target = {"history": build, "query": query,
+                          "reply": message.reply, "send": message.channel.send}[stage]
+                target.side_effect = RuntimeError("failed")
+                with (
+                    patch.object(bot, "allowed_guilds", set()),
+                    patch.object(bot, "USER_COOLDOWN_SECONDS", 0),
+                    patch.object(bot, "build_context_messages", build),
+                    patch.object(bot, "query_llm", query),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "failed"):
+                        await client.on_message(message)
+                    self.assertEqual(bot._active_users, set())
+                    target.side_effect = None
+                    await client.on_message(message)
 
 
 class SupervisionTests(unittest.IsolatedAsyncioTestCase):
