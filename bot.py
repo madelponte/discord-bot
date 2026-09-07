@@ -62,6 +62,8 @@ MAX_TOKENS = max(1, _int_env("MAX_TOKENS", 1024))
 MAX_CONTEXT_MESSAGES = max(1, _int_env("MAX_CONTEXT_MESSAGES", 6))
 # Minimum seconds between requests from the same user. 0 disables the cooldown.
 USER_COOLDOWN_SECONDS = max(0, _int_env("USER_COOLDOWN_SECONDS", 5))
+# Maximum active requests across this process; each user gets at most one.
+MAX_CONCURRENT_REQUESTS = max(1, _int_env("MAX_CONCURRENT_REQUESTS", 1))
 DISCORD_MESSAGE_LIMIT = 2000
 API_TIMEOUT_SECONDS = 120
 
@@ -90,6 +92,7 @@ log.info("MODEL_NAME           = %s", MODEL_NAME)
 log.info("MAX_TOKENS           = %d", MAX_TOKENS)
 log.info("MAX_CONTEXT_MESSAGES = %d", MAX_CONTEXT_MESSAGES)
 log.info("USER_COOLDOWN_SECONDS= %d", USER_COOLDOWN_SECONDS)
+log.info("MAX_CONCURRENT_REQUESTS = %d", MAX_CONCURRENT_REQUESTS)
 log.info("ALLOWED_GUILDS       = %s", allowed_guilds or "(all servers)")
 log.info("SYSTEM_PROMPT        = %s", SYSTEM_PROMPT[:80] + ("..." if len(SYSTEM_PROMPT) > 80 else ""))
 log.info("---------------------")
@@ -97,6 +100,8 @@ log.info("---------------------")
 # Per-user cooldown tracking. Kept at module scope so it survives the
 # reconnect loop's fresh-client construction below.
 _last_request: dict[int, float] = {}
+# Shared across fresh Discord clients so reconnects cannot bypass the limit.
+_active_users: set[int] = set()
 
 # Persistent aiohttp session — reused across all requests.
 # Creating a new ClientSession per request (the old code) spins up a new
@@ -290,7 +295,9 @@ def create_bot() -> discord.Client:
     intents.message_content = True # needed to read the prompt text
     intents.messages = True        # needed to receive message events
 
-    client = discord.Client(intents=intents)
+    # Treat generated text as untrusted: suppress user/role/everyone mentions
+    # and implicit reply-author pings on every outgoing message.
+    client = discord.Client(intents=intents, allowed_mentions=discord.AllowedMentions.none())
 
     @client.event
     async def on_ready():
@@ -317,8 +324,8 @@ def create_bot() -> discord.Client:
         if client.user is None:
             return
 
-        # Ignore messages from the bot itself
-        if message.author == client.user:
+        # Never trigger on ourselves, other bots, or webhooks (feedback loops).
+        if message.author == client.user or message.author.bot or message.webhook_id is not None:
             return
 
         # Only respond when the bot is mentioned
@@ -342,8 +349,18 @@ def create_bot() -> discord.Client:
             await message.reply("You mentioned me but didn't ask anything! Try: `@BotName your question here`")
             return
 
-        # Per-user cooldown so one person can't hammer the bot.
-        remaining = record_user_request(message.author.id, time.monotonic())
+        user_id = message.author.id
+        if user_id in _active_users or len(_active_users) >= MAX_CONCURRENT_REQUESTS:
+            try:
+                await message.reply("🕒 I'm busy right now. Please try again shortly.")
+            except discord.HTTPException:
+                log.warning("Could not send busy reply in channel %s", message.channel.id)
+            return
+
+        # Busy rejections do not consume cooldown. There is no await between
+        # checking capacity above and reserving it below, so admission is atomic
+        # on the single asyncio event loop without a lock or a waiting queue.
+        remaining = record_user_request(user_id, time.monotonic())
         if remaining is not None:
             log.info("User %s on cooldown (%.1fs left) — ignoring", message.author, remaining)
             try:
@@ -352,19 +369,23 @@ def create_bot() -> discord.Client:
                 pass
             return
 
-        # Build context from the most recent messages in this channel.
-        messages = await build_context_messages(message, client.user, MAX_CONTEXT_MESSAGES)
-        log.info("Prompt: %s  (context: %d message(s))", prompt[:120], len(messages))
+        _active_users.add(user_id)
+        try:
+            # Hold capacity through history, generation, and delivery.
+            messages = await build_context_messages(message, client.user, MAX_CONTEXT_MESSAGES)
+            log.info("Prompt: %s  (context: %d message(s))", prompt[:120], len(messages))
 
-        # Show typing indicator while generating
-        async with message.channel.typing():
-            response = await query_llm(messages)
+            async with message.channel.typing():
+                response = await query_llm(messages)
 
-        for i, chunk in enumerate(split_discord_message(response)):
-            if i == 0:
-                await message.reply(chunk)
-            else:
-                await message.channel.send(chunk)
+            for i, chunk in enumerate(split_discord_message(response)):
+                if i == 0:
+                    await message.reply(chunk)
+                else:
+                    await message.channel.send(chunk)
+        finally:
+            # Includes API/Discord failures and task cancellation.
+            _active_users.remove(user_id)
 
     return client
 

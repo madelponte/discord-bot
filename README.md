@@ -14,7 +14,8 @@ container image — so it's easy to read, audit, and run anywhere Docker runs.
 
 1. The bot logs in to Discord using the [discord.py] gateway client.
 2. It listens for messages with a lean `discord.Client` and only acts when the bot is **@-mentioned**
-   (`on_message`). Its own messages are ignored to prevent loops.
+   (`on_message`). Messages from itself, other bots, and webhooks are ignored
+   to prevent feedback loops.
 3. If an allow-list of server (guild) IDs is configured, messages from any other
    server are ignored.
 4. The bot's own mention is removed from the text to form the **prompt**; any
@@ -31,7 +32,17 @@ container image — so it's easy to read, audit, and run anywhere Docker runs.
    (`USER_COOLDOWN_SECONDS`) stops a single user from hammering the bot.
 6. While the model generates, the channel shows a typing indicator. The reply is
    posted back; responses longer than Discord's 2000-character limit are split
-   into multiple messages automatically.
+   into multiple messages automatically. All outgoing messages suppress user,
+   role, `@everyone`/`@here`, and reply-author mention notifications.
+
+By default, only **one request at a time** is processed across all channels and
+servers in this bot process. `MAX_CONCURRENT_REQUESTS` can raise that limit, but
+each user is always limited to one active request, even with cooldown disabled.
+Capacity is held from history loading through delivery of the final reply and
+released on completion, failure, or cancellation. Limits survive Discord client
+reconnections. Additional requests receive a brief busy reply; they are not
+queued and do not consume the user's cooldown. Limits are per process, not
+shared between separately deployed bot instances.
 
 HTTP calls use a single shared [aiohttp] session (created lazily, reused across
 requests) with a 120-second total timeout. Connection and API errors are caught
@@ -58,6 +69,7 @@ All configuration is via environment variables. Copy
 | `MAX_TOKENS`        |          | `1024`                                 | Maximum tokens to generate per reply. |
 | `MAX_CONTEXT_MESSAGES` |       | `6`                                    | How many of the channel's most recent messages to include as context (counting the triggering message). `1` = one-shot, no context. |
 | `USER_COOLDOWN_SECONDS` |      | `5`                                    | Minimum seconds between requests from the same user. `0` disables the cooldown. |
+| `MAX_CONCURRENT_REQUESTS` |    | `1`                                    | Maximum active requests across the bot process. Clamped to at least `1`; each user can have only one active request. Busy requests are rejected, not queued. |
 
 > **Note:** if `ALLOWED_GUILD_IDS` is left empty the bot will respond in **every**
 > server it has been added to. Set it to lock the bot to specific servers.
