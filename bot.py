@@ -5,6 +5,7 @@ import signal
 import sys
 import time
 import traceback
+from collections import deque
 
 import aiohttp
 import discord
@@ -66,6 +67,11 @@ USER_COOLDOWN_SECONDS = max(0, _int_env("USER_COOLDOWN_SECONDS", 5))
 MAX_CONCURRENT_REQUESTS = max(1, _int_env("MAX_CONCURRENT_REQUESTS", 1))
 DISCORD_MESSAGE_LIMIT = 2000
 API_TIMEOUT_SECONDS = 120
+# A normal gateway interruption resumes once. If one Discord session rapidly
+# disconnects over and over, abandon it so the supervisor can IDENTIFY a fresh
+# session (often on a different gateway host) instead of resuming forever.
+GATEWAY_RECONNECT_LIMIT = 5
+GATEWAY_RECONNECT_WINDOW_SECONDS = 60.0
 
 # Parse allowed guild IDs into a set of ints. A typo here should produce a
 # readable fatal error, not a raw ValueError traceback at import time.
@@ -280,13 +286,17 @@ async def build_context_messages(
     return context
 
 
-def create_bot() -> discord.Client:
+def create_bot(recycle_requested: asyncio.Event | None = None) -> discord.Client:
     """Construct a fresh Discord client with its event handlers registered.
 
     The supervised loop calls this each iteration so every reconnect gets a
     brand-new client. That sidesteps re-arming a closed Bot via ``bot.clear()``,
     whose reuse-after-close semantics aren't officially guaranteed by
     discord.py and have been fragile across versions.
+
+    ``discord.py`` normally resumes transient gateway disconnects internally.
+    If those disconnects become a rapid loop, ``recycle_requested`` tells the
+    supervisor that this client closed intentionally and needs a fresh session.
     """
     # Only enable the intents we actually need. Every extra intent means
     # more gateway events the bot must receive, deserialize, and discard.
@@ -298,9 +308,15 @@ def create_bot() -> discord.Client:
     # Treat generated text as untrusted: suppress user/role/everyone mentions
     # and implicit reply-author pings on every outgoing message.
     client = discord.Client(intents=intents, allowed_mentions=discord.AllowedMentions.none())
+    if recycle_requested is None:
+        recycle_requested = asyncio.Event()
+    disconnect_times: deque[float] = deque()
 
     @client.event
     async def on_ready():
+        # READY means Discord created a fresh session rather than resuming the
+        # previous one, so any reconnect burst associated with it is over.
+        disconnect_times.clear()
         log.info("✅ Logged in as %s (ID: %s)", client.user, client.user.id if client.user else "unknown")
         if allowed_guilds:
             log.info("🔒 Restricted to guild IDs: %s", allowed_guilds)
@@ -312,8 +328,29 @@ def create_bot() -> discord.Client:
     @client.event
     async def on_disconnect():
         # Fired whenever the gateway connection drops. discord.py reconnects
-        # automatically on transient blips; this just makes outages visible.
-        log.warning("⚠️  Disconnected from Discord gateway — attempting to reconnect…")
+        # automatically on transient blips. However, its internal reconnect
+        # loop keeps trying to RESUME the same session, so it never returns to
+        # our outer supervisor if that session starts rapidly cycling.
+        now = time.monotonic()
+        disconnect_times.append(now)
+        cutoff = now - GATEWAY_RECONNECT_WINDOW_SECONDS
+        while disconnect_times and disconnect_times[0] < cutoff:
+            disconnect_times.popleft()
+
+        log.warning(
+            "⚠️  Disconnected from Discord gateway — attempting to reconnect… "
+            "(%d/%d in the last %.0fs)",
+            len(disconnect_times),
+            GATEWAY_RECONNECT_LIMIT,
+            GATEWAY_RECONNECT_WINDOW_SECONDS,
+        )
+        if len(disconnect_times) >= GATEWAY_RECONNECT_LIMIT and not recycle_requested.is_set():
+            log.error(
+                "Gateway is reconnecting too frequently; discarding the current "
+                "Discord session and creating a fresh one."
+            )
+            recycle_requested.set()
+            await client.close()
 
     @client.event
     async def on_resumed():
@@ -449,7 +486,8 @@ async def run_supervised() -> None:
     try:
         while not stop.is_set():
             started_at = loop.time()
-            bot = create_bot()
+            recycle_requested = asyncio.Event()
+            bot = create_bot(recycle_requested)
             try:
                 async with bot:
                     await bot.start(DISCORD_TOKEN)
@@ -461,8 +499,10 @@ async def run_supervised() -> None:
             except Exception:
                 log.exception("Bot stopped with an exception.")
             else:
-                log.info("Bot closed cleanly.")
-                break
+                if not recycle_requested.is_set():
+                    log.info("Bot closed cleanly.")
+                    break
+                log.warning("Discord client recycled after a gateway reconnect burst.")
 
             if stop.is_set():
                 break

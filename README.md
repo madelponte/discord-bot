@@ -50,6 +50,11 @@ and reported back to the channel as a generic `⚠️` message instead of crashi
 Internal URLs, exception details, and API error bodies are logged server-side
 but are never included in Discord replies.
 
+Transient Discord gateway disconnects are resumed by `discord.py`. If one
+session disconnects at least five times within 60 seconds, the bot abandons that
+session and automatically starts a fresh Discord client instead of remaining in
+a rapid resume loop.
+
 [discord.py]: https://github.com/Rapptz/discord.py
 [aiohttp]: https://github.com/aio-libs/aiohttp
 

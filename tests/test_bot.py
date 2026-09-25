@@ -438,6 +438,20 @@ class ClientEventTests(unittest.IsolatedAsyncioTestCase):
         await client.on_disconnect()
         await client.on_resumed()
 
+    async def test_disconnect_burst_requests_one_fresh_gateway_session(self):
+        recycle_requested = asyncio.Event()
+        client = bot.create_bot(recycle_requested)
+        client.close = AsyncMock()
+
+        # The first timestamp ages out. The next five all fit in the window and
+        # trigger a recycle; further disconnect events must not close it twice.
+        with patch.object(bot.time, "monotonic", side_effect=[0, 61, 62, 63, 64, 65, 66]):
+            for _ in range(7):
+                await client.on_disconnect()
+
+        self.assertTrue(recycle_requested.is_set())
+        client.close.assert_awaited_once()
+
     async def test_on_message_ignores_unusable_messages(self):
         user = SimpleNamespace(id=1, name="Bot")
         author = SimpleNamespace(id=2, name="Alice")
@@ -762,6 +776,36 @@ class SupervisionTests(unittest.IsolatedAsyncioTestCase):
         ):
             await bot.run_supervised()
         wait.assert_awaited_once()
+        self.assertTrue(clean.started)
+
+    async def test_requested_gateway_recycle_starts_a_fresh_client(self):
+        fake_loop = SimpleNamespace(
+            add_signal_handler=Mock(),
+            time=Mock(side_effect=[0.0, 61.0, 62.0]),
+        )
+        recycled = FakeSupervisedClient()
+        clean = FakeSupervisedClient()
+        clients = iter((recycled, clean))
+
+        def create(recycle_requested):
+            client = next(clients)
+            if client is recycled:
+                client.start_effect = recycle_requested.set
+            return client
+
+        async def timeout(awaitable, *, timeout):
+            awaitable.close()
+            raise asyncio.TimeoutError
+
+        with (
+            patch.object(bot.asyncio, "get_running_loop", return_value=fake_loop),
+            patch.object(bot, "create_bot", side_effect=create),
+            patch.object(bot.asyncio, "wait_for", AsyncMock(side_effect=timeout)) as wait,
+            patch.object(bot, "_close_http_session", AsyncMock()),
+        ):
+            await bot.run_supervised()
+        wait.assert_awaited_once()
+        self.assertTrue(recycled.started)
         self.assertTrue(clean.started)
 
     async def test_exception_after_signal_does_not_restart(self):
