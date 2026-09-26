@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import signal
 import sys
 import time
@@ -22,6 +23,9 @@ log = logging.getLogger("discord-llm-bot")
 logging.getLogger("discord.gateway").setLevel(logging.WARNING)
 logging.getLogger("discord.client").setLevel(logging.WARNING)
 logging.getLogger("discord.http").setLevel(logging.WARNING)
+
+
+DISCORD_MESSAGE_LIMIT = 2000
 
 
 def _int_env(name: str, default: int) -> int:
@@ -57,7 +61,13 @@ SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
     "You are a helpful assistant. Keep responses concise and under 2000 characters.",
 )
-MAX_TOKENS = max(1, _int_env("MAX_TOKENS", 1024))
+# Longest final answer the bot will post, in characters, after any reasoning
+# is stripped. The default fits one Discord message; larger values are split.
+MAX_RESPONSE_CHARS = max(1, _int_env("MAX_RESPONSE_CHARS", DISCORD_MESSAGE_LIMIT))
+# Optional generation cap sent as ``max_tokens``. It counts reasoning tokens
+# too, so a low value can starve thinking models of room to answer. 0 (the
+# default) omits it and leaves generation length to the server.
+MAX_TOKENS = max(0, _int_env("MAX_TOKENS", 0))
 # How many of the channel's most recent messages to include as context
 # (counting the triggering message). 1 means one-shot, no surrounding context.
 MAX_CONTEXT_MESSAGES = max(1, _int_env("MAX_CONTEXT_MESSAGES", 6))
@@ -65,13 +75,35 @@ MAX_CONTEXT_MESSAGES = max(1, _int_env("MAX_CONTEXT_MESSAGES", 6))
 USER_COOLDOWN_SECONDS = max(0, _int_env("USER_COOLDOWN_SECONDS", 5))
 # Maximum active requests across this process; each user gets at most one.
 MAX_CONCURRENT_REQUESTS = max(1, _int_env("MAX_CONCURRENT_REQUESTS", 1))
-DISCORD_MESSAGE_LIMIT = 2000
 API_TIMEOUT_SECONDS = 120
 # A normal gateway interruption resumes once. If one Discord session rapidly
 # disconnects over and over, abandon it so the supervisor can IDENTIFY a fresh
 # session (often on a different gateway host) instead of resuming forever.
 GATEWAY_RECONNECT_LIMIT = 5
 GATEWAY_RECONNECT_WINDOW_SECONDS = 60.0
+
+# Fixed status replies the bot posts instead of model output. They are listed
+# together so channel history can recognise them and keep them out of the
+# model's context, where they would read as things the assistant "said".
+MSG_API_ERROR = "⚠️ The LLM server returned an error."
+MSG_API_UNEXPECTED = "⚠️ The LLM server returned an unexpected response."
+MSG_API_EMPTY = "⚠️ The LLM server returned an empty response."
+MSG_API_UNREACHABLE = "⚠️ Cannot reach the LLM server right now."
+MSG_API_TIMEOUT = "⚠️ The LLM server took too long to respond."
+MSG_API_FAILED = "⚠️ An unexpected error occurred while contacting the LLM server."
+MSG_EMPTY_PROMPT = "You mentioned me but didn't ask anything! Try: `@BotName your question here`"
+MSG_BUSY = "🕒 I'm busy right now. Please try again shortly."
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+BOT_STATUS_MESSAGES = frozenset({
+    MSG_API_ERROR,
+    MSG_API_UNEXPECTED,
+    MSG_API_EMPTY,
+    MSG_API_UNREACHABLE,
+    MSG_API_TIMEOUT,
+    MSG_API_FAILED,
+    MSG_EMPTY_PROMPT,
+    MSG_BUSY,
+})
 
 # Parse allowed guild IDs into a set of ints. A typo here should produce a
 # readable fatal error, not a raw ValueError traceback at import time.
@@ -95,7 +127,8 @@ log.info("--- Configuration ---")
 log.info("API_BASE_URL         = %s", API_BASE_URL)
 log.info("API_AUTHENTICATION   = %s", "enabled" if API_KEY else "disabled")
 log.info("MODEL_NAME           = %s", MODEL_NAME)
-log.info("MAX_TOKENS           = %d", MAX_TOKENS)
+log.info("MAX_RESPONSE_CHARS   = %d", MAX_RESPONSE_CHARS)
+log.info("MAX_TOKENS           = %s", MAX_TOKENS or "(server default)")
 log.info("MAX_CONTEXT_MESSAGES = %d", MAX_CONTEXT_MESSAGES)
 log.info("USER_COOLDOWN_SECONDS= %d", USER_COOLDOWN_SECONDS)
 log.info("MAX_CONCURRENT_REQUESTS = %d", MAX_CONCURRENT_REQUESTS)
@@ -108,6 +141,9 @@ log.info("---------------------")
 _last_request: dict[int, float] = {}
 # Shared across fresh Discord clients so reconnects cannot bypass the limit.
 _active_users: set[int] = set()
+# user_id -> (expires_at, is_member) for DM access when an allow-list is set.
+_membership_cache: dict[int, tuple[float, bool]] = {}
+MEMBERSHIP_CACHE_SECONDS = 300.0
 
 # Persistent aiohttp session — reused across all requests.
 # Creating a new ClientSession per request (the old code) spins up a new
@@ -127,6 +163,39 @@ async def get_http_session() -> aiohttp.ClientSession:
     return _http_session
 
 
+def strip_reasoning(text: str) -> str:
+    """Remove ``<think>…</think>`` reasoning that some models emit inline.
+
+    Reasoning models (DeepSeek-R1, Qwen3, QwQ, …) served without a separate
+    reasoning channel put their chain of thought in ``content``. Three shapes
+    occur: complete ``<think>…</think>`` blocks; a bare ``</think>`` when the
+    chat template already opened the block in the prompt; and an unclosed
+    ``<think>`` when generation hit ``max_tokens`` mid-thought. In the last
+    case nothing after it is an answer, so everything from it onward goes.
+    """
+    text = _THINK_BLOCK_RE.sub("", text)
+    _, closed, after = text.rpartition("</think>")
+    if closed:
+        text = after
+    text = text.split("<think>", 1)[0]
+    return text.strip()
+
+
+def truncate_response(text: str, limit: int) -> str:
+    """Shorten ``text`` to at most ``limit`` characters, ending with an ellipsis.
+
+    Cuts at the last whitespace when that keeps at least half the text, so
+    words aren't split mid-way.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    boundary = max(cut.rfind(" "), cut.rfind("\n"))
+    if boundary >= len(cut) // 2:
+        cut = cut[:boundary]
+    return cut.rstrip() + "…"
+
+
 async def query_llm(messages: list[dict]) -> str:
     """Send a chat completion request to the OpenAI-compatible API.
 
@@ -136,9 +205,10 @@ async def query_llm(messages: list[dict]) -> str:
     payload = {
         "model": MODEL_NAME,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *messages],
-        "max_tokens": MAX_TOKENS,
         "temperature": 0.7,
     }
+    if MAX_TOKENS:
+        payload["max_tokens"] = MAX_TOKENS
     url = f"{API_BASE_URL.rstrip('/')}/chat/completions"
     log.info("POST %s  (%d message(s))", url, len(messages))
 
@@ -149,24 +219,66 @@ async def query_llm(messages: list[dict]) -> str:
             if resp.status != 200:
                 error_text = await resp.text()
                 log.error("API error body: %s", error_text[:500])
-                return "⚠️ The LLM server returned an error."
+                return MSG_API_ERROR
             data = await resp.json(content_type=None)
             try:
                 reply = data["choices"][0]["message"]["content"]
             except (KeyError, IndexError, TypeError):
                 log.error("Unexpected API response shape: %r", data)
-                return "⚠️ The LLM server returned an unexpected response."
+                return MSG_API_UNEXPECTED
             if not isinstance(reply, str) or not reply.strip():
                 log.error("LLM response was empty or non-text: %r", reply)
-                return "⚠️ The LLM server returned an empty response."
-            log.info("LLM reply: %d chars", len(reply))
-            return reply
+                return MSG_API_EMPTY
+            answer = strip_reasoning(reply)
+            if not answer:
+                log.error(
+                    "LLM response contained only reasoning (%d chars); the model may "
+                    "have run out of tokens while thinking — raise or unset MAX_TOKENS.",
+                    len(reply),
+                )
+                return MSG_API_EMPTY
+            log.info("LLM reply: %d chars (%d after removing reasoning)", len(reply), len(answer))
+            if len(answer) > MAX_RESPONSE_CHARS:
+                log.info("Truncating reply to MAX_RESPONSE_CHARS=%d", MAX_RESPONSE_CHARS)
+                answer = truncate_response(answer, MAX_RESPONSE_CHARS)
+            return answer
     except aiohttp.ClientConnectorError as e:
         log.error("Cannot connect to LLM API at %s: %s", url, e)
-        return "⚠️ Cannot reach the LLM server right now."
+        return MSG_API_UNREACHABLE
+    except asyncio.TimeoutError:
+        # aiohttp's timeout errors subclass asyncio.TimeoutError. This is an
+        # expected condition with slow local models, so no traceback.
+        log.error("LLM API at %s did not respond within %ds.", url, API_TIMEOUT_SECONDS)
+        return MSG_API_TIMEOUT
     except Exception as e:
         log.error("Unexpected error in query_llm: %s\n%s", e, traceback.format_exc())
-        return "⚠️ An unexpected error occurred while contacting the LLM server."
+        return MSG_API_FAILED
+
+
+def get_trigger(message: discord.Message, bot_user: discord.ClientUser) -> str | None:
+    """Return why a message should get a response, or ``None`` to ignore it.
+
+    ``"mention"`` for an explicit @mention (including a reply with the ping on),
+    ``"reply"`` for a reply to one of the bot's messages with the ping off, and
+    ``"dm"`` for any direct message. With a guild allow-list, DMs are later
+    limited to members of an allowed guild.
+    """
+    if bot_user in message.mentions:
+        return "mention"
+    reference = message.reference
+    # ``resolved`` is the replied-to Message, a DeletedReferencedMessage (no
+    # author), or None if Discord didn't include it.
+    replied_to = getattr(reference.resolved, "author", None) if reference else None
+    if replied_to is not None and replied_to.id == bot_user.id:
+        return "reply"
+    if message.guild is None:
+        return "dm"
+    return None
+
+
+def _display_name(user: discord.abc.User) -> str:
+    """Return a user's server nickname/display name, falling back to username."""
+    return getattr(user, "display_name", user.name)
 
 
 def clean_message_content(message: discord.Message, bot_user: discord.ClientUser) -> str:
@@ -186,7 +298,7 @@ def clean_message_content(message: discord.Message, bot_user: discord.ClientUser
     for user in message.mentions:
         if user.id == bot_user.id:
             continue
-        name = getattr(user, "display_name", user.name)
+        name = _display_name(user)
         content = content.replace(f"<@{user.id}>", name).replace(f"<@!{user.id}>", name)
 
     # Resolve role and channel mentions too.
@@ -242,6 +354,42 @@ def record_user_request(user_id: int, now: float) -> float | None:
     return None
 
 
+async def is_allowed_guild_member(client: discord.Client, user_id: int) -> bool:
+    """Return whether a user belongs to any allowed guild, for DM access.
+
+    Uses one REST lookup per allowed guild (no privileged Members intent
+    needed). Results are cached so a burst of DMs doesn't hit Discord's rate
+    limits; lookups that failed for reasons other than "not a member" are not
+    cached, and fail closed.
+    """
+    now = time.monotonic()
+    for uid in [uid for uid, (expires, _) in _membership_cache.items() if expires <= now]:
+        del _membership_cache[uid]
+    cached = _membership_cache.get(user_id)
+    if cached is not None:
+        return cached[1]
+
+    lookup_failed = False
+    for guild_id in allowed_guilds:
+        guild = client.get_guild(guild_id)
+        if guild is None:
+            continue  # the bot isn't in this guild
+        try:
+            await guild.fetch_member(user_id)
+        except discord.NotFound:
+            continue
+        except discord.HTTPException as e:
+            log.warning("Could not check membership of user %s in guild %s: %s", user_id, guild_id, e)
+            lookup_failed = True
+            continue
+        _membership_cache[user_id] = (now + MEMBERSHIP_CACHE_SECONDS, True)
+        return True
+
+    if not lookup_failed:
+        _membership_cache[user_id] = (now + MEMBERSHIP_CACHE_SECONDS, False)
+    return False
+
+
 async def build_context_messages(
     message: discord.Message,
     bot_user: discord.ClientUser,
@@ -255,10 +403,16 @@ async def build_context_messages(
     preceding the trigger become the context (each classified as an assistant
     turn for the bot's own messages, or a user turn prefixed with the author's
     display name so the model can tell participants apart), and the triggering
-    message is always appended as the final, plain user turn. The result is
-    oldest-first, ready to hand to the chat-completions API.
+    message, prefixed the same way, is always the final user turn. The bot's
+    fixed status replies (errors, busy notices) are left out.
+
+    Many chat templates (Mistral, Gemma, …) reject conversations whose roles
+    don't strictly alternate user/assistant starting with a user turn, which a
+    busy channel or a split reply would otherwise produce. So consecutive
+    same-role turns are merged, and leading assistant turns are dropped. The
+    result is oldest-first, ready to hand to the chat-completions API.
     """
-    context: list[dict] = []
+    turns: list[tuple[str, str]] = []
 
     # Pull the messages just before the trigger for channel context. (max=1
     # means no history — just the triggering message, i.e. one-shot.)
@@ -273,16 +427,24 @@ async def build_context_messages(
             if not content:
                 continue
             if msg.author.id == bot_user.id:
-                context.append({"role": "assistant", "content": content})
+                if content not in BOT_STATUS_MESSAGES:
+                    turns.append(("assistant", content))
             else:
-                name = getattr(msg.author, "display_name", msg.author.name)
-                context.append({"role": "user", "content": f"{name}: {content}"})
+                turns.append(("user", f"{_display_name(msg.author)}: {content}"))
 
     # The triggering message is always the final user turn (the actual prompt).
     prompt = clean_message_content(message, bot_user)
     if prompt:
-        context.append({"role": "user", "content": prompt})
+        turns.append(("user", f"{_display_name(message.author)}: {prompt}"))
 
+    context: list[dict] = []
+    for role, content in turns:
+        if not context and role == "assistant":
+            continue
+        if context and context[-1]["role"] == role:
+            context[-1]["content"] += f"\n{content}"
+        else:
+            context.append({"role": role, "content": content})
     return context
 
 
@@ -361,35 +523,55 @@ def create_bot(recycle_requested: asyncio.Event | None = None) -> discord.Client
         if client.user is None:
             return
 
-        # Never trigger on ourselves, other bots, or webhooks (feedback loops).
-        if message.author == client.user or message.author.bot or message.webhook_id is not None:
+        # Never trigger on ourselves, other bots, or webhooks (feedback loops),
+        # or on system messages such as pins, which can reference bot messages.
+        if (
+            message.author == client.user
+            or message.author.bot
+            or message.webhook_id is not None
+            or message.is_system()
+        ):
             return
 
-        # Only respond when the bot is mentioned
-        if client.user not in message.mentions:
+        trigger = get_trigger(message, client.user)
+        if trigger is None:
             return
 
         log.info(
-            "Mentioned by %s in guild=%s channel=%s",
+            "Triggered (%s) by %s in guild=%s channel=%s",
+            trigger,
             message.author,
             message.guild.id if message.guild else "DM",
             message.channel.id,
         )
 
-        # Guild restriction check
-        if allowed_guilds and (message.guild is None or message.guild.id not in allowed_guilds):
-            log.info("Ignoring — guild not in allow list")
-            return
-
-        prompt = clean_message_content(message, client.user)
-        if not prompt:
-            await message.reply("You mentioned me but didn't ask anything! Try: `@BotName your question here`")
-            return
+        # Guild restriction check. With an allow-list, DMs are accepted only
+        # from members of an allowed guild.
+        if allowed_guilds:
+            if message.guild is None:
+                if not await is_allowed_guild_member(client, message.author.id):
+                    log.info("Ignoring DM — author is not a member of an allowed guild")
+                    return
+            elif message.guild.id not in allowed_guilds:
+                log.info("Ignoring — guild not in allow list")
+                return
 
         user_id = message.author.id
+        prompt = clean_message_content(message, client.user)
+        if not prompt:
+            # Only a bare @mention gets the usage hint; a text-less reply or DM
+            # (e.g. just an image) is ignored. The hint is subject to the
+            # cooldown so repeated bare mentions can't spam it.
+            if trigger == "mention" and record_user_request(user_id, time.monotonic()) is None:
+                try:
+                    await message.reply(MSG_EMPTY_PROMPT)
+                except discord.HTTPException:
+                    log.warning("Could not send empty-prompt reply in channel %s", message.channel.id)
+            return
+
         if user_id in _active_users or len(_active_users) >= MAX_CONCURRENT_REQUESTS:
             try:
-                await message.reply("🕒 I'm busy right now. Please try again shortly.")
+                await message.reply(MSG_BUSY)
             except discord.HTTPException:
                 log.warning("Could not send busy reply in channel %s", message.channel.id)
             return
@@ -415,9 +597,13 @@ def create_bot(recycle_requested: asyncio.Event | None = None) -> discord.Client
             async with message.channel.typing():
                 response = await query_llm(messages)
 
+            # message.reply() would fail if the user deleted their message
+            # during generation, losing the response. This reference degrades
+            # to a plain channel message instead.
+            reference = message.to_reference(fail_if_not_exists=False)
             for i, chunk in enumerate(split_discord_message(response)):
                 if i == 0:
-                    await message.reply(chunk)
+                    await message.channel.send(chunk, reference=reference)
                 else:
                     await message.channel.send(chunk)
         finally:
