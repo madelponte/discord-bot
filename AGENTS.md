@@ -4,7 +4,7 @@
 
 This repository contains a small self-hosted Discord bot that bridges Discord messages to an OpenAI-compatible chat-completions API. The runtime application is implemented in one Python module and has two direct dependencies.
 
-When directly mentioned, the bot:
+When directly mentioned, replied to, or sent a direct message, the bot:
 
 1. Checks the optional guild allow-list and per-user cooldown.
 2. Removes its own mention and resolves other Discord mentions to readable names.
@@ -45,9 +45,10 @@ It is intended to work with OpenAI-compatible backends such as llama.cpp, Ollama
 - `API_BASE_URL` — defaults to `http://llama-server:8080/v1` when absent or blank.
 - `API_KEY` — optional API key sent as a Bearer token; empty disables API authentication.
 - `MODEL_NAME` — defaults to `default` when absent or blank.
-- `ALLOWED_GUILD_IDS` — comma-separated integer guild IDs; empty permits all guilds. When an allow-list is set, direct messages are rejected.
+- `ALLOWED_GUILD_IDS` — comma-separated integer guild IDs; empty permits all guilds. When an allow-list is set, direct messages are accepted only from members of a listed guild.
 - `SYSTEM_PROMPT` — defaults to `You are a helpful assistant. Keep responses concise and under 2000 characters.` when the variable is absent. An explicitly blank value remains blank.
-- `MAX_TOKENS` — defaults to `1024` and is clamped to at least `1`.
+- `MAX_RESPONSE_CHARS` — defaults to `2000` and is clamped to at least `1`; the final answer, after reasoning is stripped, is truncated to this many characters. Values above 2,000 are split across Discord messages.
+- `MAX_TOKENS` — optional `max_tokens` generation cap; defaults to `0`, which omits it from requests. Negative values are clamped to `0`. It counts reasoning tokens, so it is not a response-length control.
 - `MAX_CONTEXT_MESSAGES` — defaults to `6` and is clamped to at least `1`; `1` disables history context.
 - `USER_COOLDOWN_SECONDS` — defaults to `5` and is clamped to at least `0`; `0` disables the cooldown.
 - `MAX_CONCURRENT_REQUESTS` — defaults to `1` and is clamped to at least `1`; limits active requests per process from history loading through reply delivery. Each user is limited to one active request. Busy requests are rejected without queuing or consuming cooldown.
@@ -66,7 +67,11 @@ Key functions in `bot.py`:
 
 - `_int_env()` — validates integer environment variables.
 - `get_http_session()` — lazily creates the shared `aiohttp.ClientSession` with a 120-second timeout.
-- `query_llm()` — calls the configured chat-completions endpoint and validates its response.
+- `query_llm()` — calls the configured chat-completions endpoint, validates its response, and strips inline reasoning.
+- `truncate_response()` — shortens the final answer to `MAX_RESPONSE_CHARS` at a word boundary with an ellipsis.
+- `strip_reasoning()` — removes `<think>…</think>` blocks, a bare leading block closed by `</think>`, and unfinished `<think>` output.
+- `is_allowed_guild_member()` — checks and caches whether a DM author belongs to an allowed guild.
+- `get_trigger()` — decides whether a message is a mention, a reply to the bot, a DM, or should be ignored.
 - `clean_message_content()` — removes the bot mention and resolves user, role, and channel mentions.
 - `split_discord_message()` — splits output into messages no longer than 2,000 characters.
 - `record_user_request()` — enforces and cleans up per-user cooldown state.
@@ -74,13 +79,13 @@ Key functions in `bot.py`:
 - `create_bot()` — configures Discord intents and event handlers.
 - `run_supervised()` — runs fresh Discord clients with exponential-backoff recovery and graceful signal handling.
 
-The shared HTTP session, cooldown map, and active-user set intentionally live at module scope so they persist across Discord client reconnections. Admission checks and reservation must not yield to the event loop; release active-user reservations in `finally`, including on cancellation. Preserve fresh-client construction in the supervised reconnect loop; reusing a closed `discord.Client` is intentionally avoided.
+The shared HTTP session, cooldown map, membership cache, and active-user set intentionally live at module scope so they persist across Discord client reconnections. Admission checks and reservation must not yield to the event loop; release active-user reservations in `finally`, including on cancellation. Preserve fresh-client construction in the supervised reconnect loop; reusing a closed `discord.Client` is intentionally avoided.
 
 ## Discord requirements
 
 The Discord application must have **Message Content Intent** enabled. The bot needs channel access and permission to send messages. **Read Message History** enables multi-turn context; history failures degrade to using only the triggering message. Adding the cooldown reaction may require **Add Reactions**, but reaction failures are intentionally ignored.
 
-The bot only responds when directly mentioned by a human user; messages from bots and webhooks are ignored. Client-wide `AllowedMentions.none()` suppresses all outgoing mention notifications, including reply-author pings. If `ALLOWED_GUILD_IDS` is empty, it can respond in any guild where it has the necessary access. If the allow-list is nonempty, only listed guilds are accepted.
+The bot responds to human users who mention it, reply to one of its messages (with or without the reply ping), or send it a direct message; messages from bots, webhooks, and Discord system messages are ignored. Only a bare @mention gets the empty-prompt hint; text-less replies and DMs are ignored. Client-wide `AllowedMentions.none()` suppresses all outgoing mention notifications, including reply-author pings. If `ALLOWED_GUILD_IDS` is empty, it can respond in any guild where it has the necessary access. If the allow-list is nonempty, only listed guilds are accepted, and DMs are accepted only from members of a listed guild the bot is in. Membership is checked with `Guild.fetch_member()` (no privileged Members intent) and cached for 5 minutes; lookup errors fail closed and are not cached.
 
 ## Development guidance
 
