@@ -71,11 +71,12 @@ Key functions in `bot.py`:
 - `truncate_response()` — shortens the final answer to `MAX_RESPONSE_CHARS` at a word boundary with an ellipsis.
 - `strip_reasoning()` — removes `<think>…</think>` blocks, a bare leading block closed by `</think>`, and unfinished `<think>` output.
 - `is_allowed_guild_member()` — checks and caches whether a DM author belongs to an allowed guild.
+- `mention_participants()` — rewrites participants' display names in a reply to Discord mentions and returns the IDs to allow.
 - `get_trigger()` — decides whether a message is a mention, a reply to the bot, a DM, or should be ignored.
 - `clean_message_content()` — removes the bot mention and resolves user, role, and channel mentions.
 - `split_discord_message()` — splits output into messages no longer than 2,000 characters.
 - `record_user_request()` — enforces and cleans up per-user cooldown state.
-- `build_context_messages()` — builds oldest-first OpenAI-style conversation turns from recent channel history.
+- `build_context_messages()` — builds oldest-first OpenAI-style conversation turns from recent channel history and returns the human participants (`{user_id: display_name}`) the model can see.
 - `create_bot()` — configures Discord intents and event handlers.
 - `run_supervised()` — runs fresh Discord clients with exponential-backoff recovery and graceful signal handling.
 
@@ -85,7 +86,7 @@ The shared HTTP session, cooldown map, membership cache, and active-user set int
 
 The Discord application must have **Message Content Intent** enabled. The bot needs channel access and permission to send messages. **Read Message History** enables multi-turn context; history failures degrade to using only the triggering message. Adding the cooldown reaction may require **Add Reactions**, but reaction failures are intentionally ignored.
 
-The bot responds to human users who mention it, reply to one of its messages (with or without the reply ping), or send it a direct message; messages from bots, webhooks, and Discord system messages are ignored. Only a bare @mention gets the empty-prompt hint; text-less replies and DMs are ignored. Client-wide `AllowedMentions.none()` suppresses all outgoing mention notifications, including reply-author pings. If `ALLOWED_GUILD_IDS` is empty, it can respond in any guild where it has the necessary access. If the allow-list is nonempty, only listed guilds are accepted, and DMs are accepted only from members of a listed guild the bot is in. Membership is checked with `Guild.fetch_member()` (no privileged Members intent) and cached for 5 minutes; lookup errors fail closed and are not cached.
+The bot responds to human users who mention it, reply to one of its messages (with or without the reply ping), or send it a direct message; messages from bots, webhooks, and Discord system messages are ignored. Only a bare @mention gets the empty-prompt hint; text-less replies and DMs are ignored. Client-wide `AllowedMentions.none()` suppresses outgoing mention notifications, including reply-author pings. The one exception: `mention_participants()` rewrites display names of human conversation participants in model replies to `<@id>` mentions, and those replies allow pings for exactly those user IDs. Never allow `@everyone`, roles, or arbitrary users. If `ALLOWED_GUILD_IDS` is empty, it can respond in any guild where it has the necessary access. If the allow-list is nonempty, only listed guilds are accepted, and DMs are accepted only from members of a listed guild the bot is in. Membership is checked with `Guild.fetch_member()` (no privileged Members intent) and cached for 5 minutes; lookup errors fail closed and are not cached.
 
 ## Development guidance
 

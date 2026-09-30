@@ -79,6 +79,8 @@ class FakeMessage:
         self.author = author
         self.webhook_id = webhook_id
         self.mentions = mentions or []
+        for user in self.mentions:
+            user.__dict__.setdefault("bot", False)
         self.role_mentions = role_mentions or []
         self.channel_mentions = channel_mentions or []
         self.channel = channel or FakeChannel()
@@ -452,6 +454,27 @@ class MessageUtilityTests(unittest.TestCase):
                 self.assertEqual(result, expected)
                 self.assertLessEqual(len(result), limit)
 
+    def test_mention_participants(self):
+        participants = {11: "Alice", 12: "Alice B", 13: "Bob", 14: "Al", 15: "Sam", 16: "Sam"}
+        cases = [
+            ("no names here", "no names here", []),
+            # Plain and @-prefixed names; the longest name wins; order of first use.
+            ("Alice and @Bob should talk to Alice B.",
+             "<@11> and <@13> should talk to <@12>.", [11, 13, 12]),
+            ("Thanks Alice! Alice, hi", "Thanks <@11>! <@11>, hi", [11]),
+            # Code spans and blocks are left untouched.
+            ("see `Bob` and\n```\nBob()\n```", "see `Bob` and\n```\nBob()\n```", []),
+            # E-mail addresses and URL paths are not names.
+            ("alice@Alice http://x.com/Bob", "alice@Alice http://x.com/Bob", []),
+            # Whole words only, case-sensitive; short and ambiguous names skipped.
+            ("Bobby bob Al Sam", "Bobby bob Al Sam", []),
+        ]
+        for text, expected, ids in cases:
+            with self.subTest(text=text):
+                self.assertEqual(bot.mention_participants(text, participants), (expected, ids))
+        self.assertEqual(bot.mention_participants("Al", {14: "Al"}), ("Al", []))
+        self.assertEqual(bot.mention_participants("x", {}), ("x", []))
+
     def test_get_trigger(self):
         bot_user = SimpleNamespace(id=1, name="Bot")
         alice = SimpleNamespace(id=2, name="Alice")
@@ -508,10 +531,10 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
         message = FakeMessage("<@1> hello", author, mentions=[bot_user])
         self.assertEqual(
             await bot.build_context_messages(message, bot_user, 1),
-            [{"role": "user", "content": "Alice: hello"}],
+            ([{"role": "user", "content": "Alice: hello"}], {2: "Alice"}),
         )
         message.content = "<@1>"
-        self.assertEqual(await bot.build_context_messages(message, bot_user, 1), [])
+        self.assertEqual(await bot.build_context_messages(message, bot_user, 1), ([], {}))
 
     async def test_history_is_oldest_first_and_skips_empty_messages(self):
         bot_user = SimpleNamespace(id=1, name="Bot")
@@ -524,22 +547,30 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
         trigger = FakeMessage("<@1> now", bob, mentions=[bot_user], channel=channel)
         self.assertEqual(
             await bot.build_context_messages(trigger, bot_user, 4),
-            [
-                {"role": "user", "content": "Alice: old"},
-                {"role": "assistant", "content": "answer"},
-                {"role": "user", "content": "Bob: now"},
-            ],
+            (
+                [
+                    {"role": "user", "content": "Alice: old"},
+                    {"role": "assistant", "content": "answer"},
+                    {"role": "user", "content": "Bob: now"},
+                ],
+                {2: "Alice", 3: "Bob"},
+            ),
         )
 
     async def test_history_alternates_roles_and_skips_status_replies(self):
         bot_user = SimpleNamespace(id=1, name="Bot")
         alice = SimpleNamespace(id=2, name="Alice")
         bob = SimpleNamespace(id=3, name="Bob")
+        carol = SimpleNamespace(id=4, name="Carol")
+        dave = SimpleNamespace(id=5, name="Dave")
+        helper_bot = SimpleNamespace(id=6, name="Helper", bot=True)
+        erin = SimpleNamespace(id=7, name="Erin")
         history = [  # oldest-first here; FakeChannel yields newest-first
-            FakeMessage("stale answer", bot_user),
-            FakeMessage("hi", alice),
+            # Dropped as a leading assistant turn, so Erin isn't a participant.
+            FakeMessage("stale answer <@7>", bot_user, mentions=[erin]),
+            FakeMessage("hi <@4> and <@6>", alice, mentions=[carol, helper_bot]),
             FakeMessage("hey", bob),
-            FakeMessage("part one", bot_user),
+            FakeMessage("part one for <@5>", bot_user, mentions=[dave]),
             FakeMessage(bot.MSG_API_ERROR, bot_user),
             FakeMessage("part two", bot_user),
             FakeMessage(bot.MSG_BUSY, bot_user),
@@ -547,14 +578,19 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
         ]
         channel = FakeChannel(list(reversed(history)))
         trigger = FakeMessage("<@1> go", bob, mentions=[bot_user], channel=channel)
+        messages, participants = await bot.build_context_messages(
+            trigger, bot_user, len(history) + 1
+        )
         self.assertEqual(
-            await bot.build_context_messages(trigger, bot_user, len(history) + 1),
+            messages,
             [
-                {"role": "user", "content": "Alice: hi\nBob: hey"},
-                {"role": "assistant", "content": "part one\npart two"},
+                {"role": "user", "content": "Alice: hi Carol and Helper\nBob: hey"},
+                {"role": "assistant", "content": "part one for Dave\npart two"},
                 {"role": "user", "content": "Alice: more\nBob: go"},
             ],
         )
+        # Other bots are never participants, so the reply can't ping them.
+        self.assertEqual(participants, {2: "Alice", 4: "Carol", 3: "Bob", 5: "Dave"})
 
     async def test_history_http_error_degrades_to_trigger(self):
         error = discord.HTTPException(RawResponse(), "history failed")
@@ -564,7 +600,7 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
         trigger = FakeMessage("<@1> hello", author, mentions=[bot_user], channel=channel)
         self.assertEqual(
             await bot.build_context_messages(trigger, bot_user, 3),
-            [{"role": "user", "content": "Alice: hello"}],
+            ([{"role": "user", "content": "Alice: hello"}], {2: "Alice"}),
         )
 
 
@@ -812,22 +848,53 @@ class ClientEventTests(unittest.IsolatedAsyncioTestCase):
         )
         client = self.make_client(user)
         context = [{"role": "user", "content": "hello"}]
+        participants = {2: "Alice", 3: "Bob"}
         with (
             patch.object(bot, "allowed_guilds", {10}),
             patch.object(bot, "record_user_request", return_value=None),
-            patch.object(bot, "build_context_messages", AsyncMock(return_value=context)) as build,
-            patch.object(bot, "query_llm", AsyncMock(return_value="first\nsecond")) as query,
-            patch.object(bot, "split_discord_message", return_value=["first", "second"]),
+            patch.object(
+                bot, "build_context_messages", AsyncMock(return_value=(context, participants))
+            ) as build,
+            patch.object(bot, "query_llm", AsyncMock(return_value="Hi Bob\nsecond")) as query,
+            patch.object(
+                bot, "split_discord_message", side_effect=lambda text: text.split("\n")
+            ) as split,
         ):
             await client.on_message(message)
         build.assert_awaited_once_with(message, user, bot.MAX_CONTEXT_MESSAGES)
         query.assert_awaited_once_with(context)
+        split.assert_called_once_with("Hi <@3>\nsecond")
         message.to_reference.assert_called_once_with(fail_if_not_exists=False)
         message.reply.assert_not_awaited()
-        self.assertEqual(
-            channel.send.await_args_list,
-            [call("first", reference=message.outgoing_reference), call("second")],
-        )
+        first, second = channel.send.await_args_list
+        self.assertEqual(first.args, ("Hi <@3>",))
+        self.assertIs(first.kwargs["reference"], message.outgoing_reference)
+        self.assertEqual(second.args, ("second",))
+        self.assertNotIn("reference", second.kwargs)
+        for sent in (first, second):
+            # Only the named participant may be pinged; the client default
+            # (AllowedMentions.none()) still blocks everyone, roles, and replies.
+            merged = client._connection.allowed_mentions.merge(sent.kwargs["allowed_mentions"])
+            self.assertEqual(
+                merged.to_dict(),
+                {"parse": [], "users": [3]},
+            )
+
+    async def test_reply_without_participant_names_pings_no_one(self):
+        user = SimpleNamespace(id=1, name="Bot")
+        message = FakeMessage("<@1> hello", SimpleNamespace(id=2, name="Alice"), mentions=[user])
+        client = self.make_client(user)
+        with (
+            patch.object(bot, "allowed_guilds", set()),
+            patch.object(bot, "USER_COOLDOWN_SECONDS", 0),
+            patch.object(bot, "MAX_CONTEXT_MESSAGES", 1),
+            patch.object(bot, "query_llm", AsyncMock(return_value="@everyone hello")),
+        ):
+            await client.on_message(message)
+        sent = message.channel.send.await_args
+        self.assertEqual(sent.args, ("@everyone hello",))
+        merged = client._connection.allowed_mentions.merge(sent.kwargs["allowed_mentions"])
+        self.assertEqual(merged.to_dict(), {"parse": [], "users": []})
 
     async def test_global_limit_rejects_without_queue_or_cooldown_across_clients(self):
         user = SimpleNamespace(id=1, name="Bot")
@@ -917,7 +984,7 @@ class ClientEventTests(unittest.IsolatedAsyncioTestCase):
                     started.set()
                     await asyncio.Event().wait()
 
-                build = AsyncMock(return_value=[{"role": "user", "content": "hello"}])
+                build = AsyncMock(return_value=([{"role": "user", "content": "hello"}], {}))
                 query = AsyncMock(return_value="x" * 2001)
                 target, call_number = stage_target(stage, build, query, message)
                 target.side_effect = on_call(call_number, block)
@@ -948,7 +1015,7 @@ class ClientEventTests(unittest.IsolatedAsyncioTestCase):
                 user = SimpleNamespace(id=1, name="Bot")
                 client = self.make_client(user)
                 message = FakeMessage("<@1> hello", SimpleNamespace(id=2), mentions=[user])
-                build = AsyncMock(return_value=[{"role": "user", "content": "hello"}])
+                build = AsyncMock(return_value=([{"role": "user", "content": "hello"}], {}))
                 query = AsyncMock(return_value="x" * 2001)
                 target, call_number = stage_target(stage, build, query, message)
 

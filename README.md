@@ -47,8 +47,16 @@ container image — so it's easy to read, audit, and run anywhere Docker runs.
    boundary with "…". If `MAX_RESPONSE_CHARS` is raised above Discord's
    2000-character limit, the answer is split across multiple messages. If an
    optional `MAX_TOKENS` cap is set and the model spends it all thinking, the
-   bot reports an empty response and logs a hint. All outgoing messages suppress user,
-   role, `@everyone`/`@here`, and reply-author mention notifications.
+   bot reports an empty response and logs a hint.
+7. When the answer names someone taking part in the conversation (an author
+   of, or user mentioned in, the messages the model was shown), the name is
+   turned into a real Discord mention and that person is pinged. Models write
+   names as plain text, which Discord never pings, so the bot does this itself.
+   Names are matched by display name, case-sensitively and as whole words
+   (`Alice` or `@Alice`); names under 3 characters, names shared by two
+   participants, and text inside code are left alone. Nobody else can be
+   pinged: `@everyone`/`@here`, roles, other bots, users outside the
+   conversation, and the reply-author ping are always suppressed.
 
 By default, only **one request at a time** is processed across all channels and
 servers in this bot process. `MAX_CONCURRENT_REQUESTS` can raise that limit, but

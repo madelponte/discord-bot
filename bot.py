@@ -394,7 +394,7 @@ async def build_context_messages(
     message: discord.Message,
     bot_user: discord.ClientUser,
     max_messages: int,
-) -> list[dict]:
+) -> tuple[list[dict], dict[int, str]]:
     """Build a multi-turn ``messages`` array from the channel's recent history.
 
     Rather than following the reply chain, we include the ``max_messages`` most
@@ -411,8 +411,12 @@ async def build_context_messages(
     busy channel or a split reply would otherwise produce. So consecutive
     same-role turns are merged, and leading assistant turns are dropped. The
     result is oldest-first, ready to hand to the chat-completions API.
+
+    Also returns the human participants the model can see by name — authors
+    and users mentioned in the included messages — as ``{user_id: name}``, so
+    the reply can ping them (see ``mention_participants``).
     """
-    turns: list[tuple[str, str]] = []
+    turns: list[tuple[str, str, discord.Message]] = []
 
     # Pull the messages just before the trigger for channel context. (max=1
     # means no history — just the triggering message, i.e. one-shot.)
@@ -428,24 +432,67 @@ async def build_context_messages(
                 continue
             if msg.author.id == bot_user.id:
                 if content not in BOT_STATUS_MESSAGES:
-                    turns.append(("assistant", content))
+                    turns.append(("assistant", content, msg))
             else:
-                turns.append(("user", f"{_display_name(msg.author)}: {content}"))
+                turns.append(("user", f"{_display_name(msg.author)}: {content}", msg))
 
     # The triggering message is always the final user turn (the actual prompt).
     prompt = clean_message_content(message, bot_user)
     if prompt:
-        turns.append(("user", f"{_display_name(message.author)}: {prompt}"))
+        turns.append(("user", f"{_display_name(message.author)}: {prompt}", message))
 
     context: list[dict] = []
-    for role, content in turns:
+    participants: dict[int, str] = {}
+    for role, content, msg in turns:
         if not context and role == "assistant":
             continue
+        for user in (msg.author, *msg.mentions):
+            if user.id != bot_user.id and not user.bot:
+                participants[user.id] = _display_name(user)
         if context and context[-1]["role"] == role:
             context[-1]["content"] += f"\n{content}"
         else:
             context.append({"role": role, "content": content})
-    return context
+    return context, participants
+
+
+def mention_participants(text: str, participants: dict[int, str]) -> tuple[str, list[int]]:
+    """Turn participants' names in ``text`` into real Discord mentions.
+
+    Models write names as plain text ("Alice" or "@Alice"), which Discord never
+    pings; only ``<@user_id>`` does. Each participant's display name — matched
+    case-sensitively as a whole word, with an optional leading ``@`` — becomes
+    a mention. Names shorter than 3 characters (too likely to be ordinary
+    words), names shared by several participants (ambiguous), and anything
+    inside code spans or code blocks are left alone.
+
+    Returns the rewritten text and the IDs actually mentioned, in order, for
+    use as the message's allowed mentions.
+    """
+    ids_by_name: dict[str, set[int]] = {}
+    for user_id, name in participants.items():
+        if len(name) >= 3:
+            ids_by_name.setdefault(name, set()).add(user_id)
+    names = {name: ids.pop() for name, ids in ids_by_name.items() if len(ids) == 1}
+    if not names:
+        return text, []
+
+    # Longest names first, so "Alice B" wins over "Alice". Group 1 matches code
+    # so it can be skipped; the lookbehind keeps e-mail addresses and URL
+    # paths ("x@Alice", "/Alice") intact.
+    alternation = "|".join(re.escape(name) for name in sorted(names, key=len, reverse=True))
+    pattern = re.compile(rf"(```.*?```|`[^`\n]*`)|(?<![\w/@])@?({alternation})(?!\w)", re.DOTALL)
+    mentioned: list[int] = []
+
+    def replace(match: re.Match) -> str:
+        if match.group(1):
+            return match.group(1)
+        user_id = names[match.group(2)]
+        if user_id not in mentioned:
+            mentioned.append(user_id)
+        return f"<@{user_id}>"
+
+    return pattern.sub(replace, text), mentioned
 
 
 def create_bot(recycle_requested: asyncio.Event | None = None) -> discord.Client:
@@ -468,7 +515,8 @@ def create_bot(recycle_requested: asyncio.Event | None = None) -> discord.Client
     intents.messages = True        # needed to receive message events
 
     # Treat generated text as untrusted: suppress user/role/everyone mentions
-    # and implicit reply-author pings on every outgoing message.
+    # and implicit reply-author pings on every outgoing message. Model replies
+    # re-allow pings only for conversation participants they name.
     client = discord.Client(intents=intents, allowed_mentions=discord.AllowedMentions.none())
     if recycle_requested is None:
         recycle_requested = asyncio.Event()
@@ -591,7 +639,9 @@ def create_bot(recycle_requested: asyncio.Event | None = None) -> discord.Client
         _active_users.add(user_id)
         try:
             # Hold capacity through history, generation, and delivery.
-            messages = await build_context_messages(message, client.user, MAX_CONTEXT_MESSAGES)
+            messages, participants = await build_context_messages(
+                message, client.user, MAX_CONTEXT_MESSAGES
+            )
             log.info("Prompt: %s  (context: %d message(s))", prompt[:120], len(messages))
 
             async with message.channel.typing():
@@ -601,11 +651,16 @@ def create_bot(recycle_requested: asyncio.Event | None = None) -> discord.Client
             # during generation, losing the response. This reference degrades
             # to a plain channel message instead.
             reference = message.to_reference(fail_if_not_exists=False)
+            response, mentioned = mention_participants(response, participants)
+            # Ping only the participants named in this reply. Merged with the
+            # client-wide AllowedMentions.none(), so @everyone, roles, and the
+            # reply-author ping stay suppressed.
+            allowed = discord.AllowedMentions(users=[discord.Object(id=uid) for uid in mentioned])
             for i, chunk in enumerate(split_discord_message(response)):
                 if i == 0:
-                    await message.channel.send(chunk, reference=reference)
+                    await message.channel.send(chunk, reference=reference, allowed_mentions=allowed)
                 else:
-                    await message.channel.send(chunk)
+                    await message.channel.send(chunk, allowed_mentions=allowed)
         finally:
             # Includes API/Discord failures and task cancellation.
             _active_users.remove(user_id)
