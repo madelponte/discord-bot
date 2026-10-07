@@ -163,7 +163,7 @@ python -u bot.py
 
 - **Python 3.14** (the container is based on `python:3.14-slim`; 3.10+ works locally)
 - [`discord.py`](requirements.txt) `2.7.1`
-- [`aiohttp`](requirements.txt) `3.14.3`
+- [`aiohttp`](requirements.txt) `3.14.4`
 
 ## Testing
 
