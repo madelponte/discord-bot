@@ -179,7 +179,7 @@ DISCORD_TOKEN=test .venv/bin/python -m coverage run -m unittest discover -s test
 ```
 
 The coverage threshold is configured in [`.coveragerc`](.coveragerc), and CI
-runs the suite on Python 3.10 and 3.14.
+runs the suite on Python 3.10, 3.14, and 3.15.
 
 ## License
 

@@ -1,2 +1,8 @@
+# Python 3.15 status (checked against 3.15.0rc3, 2026-10-09): no blockers.
+# All dependencies install from wheels on amd64 and arm64. Notes to track:
+# - frozenlist (via aiohttp) 1.8.0 has no cp315 wheel; pip uses its
+#   pure-Python wheel, which works but skips the C speedups.
+# - discord.py 2.7.1 calls asyncio.iscoroutinefunction(), which is removed in
+#   3.16. Fixed on discord.py master; wait for the next release before 3.16.
 discord.py==2.7.1
 aiohttp==3.14.4
