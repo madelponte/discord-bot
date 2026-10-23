@@ -18,7 +18,7 @@ It is intended to work with OpenAI-compatible backends such as llama.cpp, Ollama
 
 - `bot.py` — configuration, Discord handlers, LLM HTTP client, reconnect supervision, and entry point.
 - `requirements.txt` — pinned direct dependencies: `discord.py` and `aiohttp`.
-- `Dockerfile` — production image based on Python 3.14 slim.
+- `Dockerfile` — production image based on Python 3.15 slim.
 - `compose.yml` — runs the published bot image, loads `.env`, and contains a commented llama.cpp example.
 - `.env.example` — configuration template. Never commit real tokens or `.env`.
 - `README.md` — user-facing setup, configuration, and operation documentation.
@@ -26,7 +26,7 @@ It is intended to work with OpenAI-compatible backends such as llama.cpp, Ollama
 
 ## Runtime and dependencies
 
-- The container uses Python 3.14.
+- The container uses Python 3.15.
 - The source is compatible with Python 3.10+ for local development.
 - Direct dependencies are pinned in `requirements.txt`.
 - Use the existing `.venv` for local Python commands. Its Python version may differ from the container version.

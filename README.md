@@ -161,9 +161,9 @@ python -u bot.py
 
 ## Requirements
 
-- **Python 3.14** (the container is based on `python:3.14-slim`; 3.10+ works locally)
+- **Python 3.15** (the container is based on `python:3.15-slim`; 3.10+ works locally)
 - [`discord.py`](requirements.txt) `2.7.1`
-- [`aiohttp`](requirements.txt) `3.14.4`
+- [`aiohttp`](requirements.txt) `3.14.5`
 
 ## Testing
 
