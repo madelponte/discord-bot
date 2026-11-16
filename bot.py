@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -75,7 +76,11 @@ MAX_CONTEXT_MESSAGES = max(1, _int_env("MAX_CONTEXT_MESSAGES", 6))
 USER_COOLDOWN_SECONDS = max(0, _int_env("USER_COOLDOWN_SECONDS", 5))
 # Maximum active requests across this process; each user gets at most one.
 MAX_CONCURRENT_REQUESTS = max(1, _int_env("MAX_CONCURRENT_REQUESTS", 1))
-API_TIMEOUT_SECONDS = 120
+# Replies are streamed, so this is an idle timeout, not a total one: it fires
+# only when the LLM server sends nothing at all (no connection, no tokens, no
+# keep-alives) for this long. A slow model that keeps producing tokens, even
+# reasoning tokens, can generate for as long as it needs.
+API_IDLE_TIMEOUT_SECONDS = 120
 # A normal gateway interruption resumes once. If one Discord session rapidly
 # disconnects over and over, abandon it so the supervisor can IDENTIFY a fresh
 # session (often on a different gateway host) instead of resuming forever.
@@ -157,7 +162,14 @@ async def get_http_session() -> aiohttp.ClientSession:
     if _http_session is None or _http_session.closed:
         headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else None
         _http_session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS),
+            # ``connect`` bounds DNS and TCP setup; ``sock_read`` restarts on
+            # every chunk received. ``total=None`` removes aiohttp's default
+            # five-minute cap on the whole request.
+            timeout=aiohttp.ClientTimeout(
+                total=None,
+                connect=API_IDLE_TIMEOUT_SECONDS,
+                sock_read=API_IDLE_TIMEOUT_SECONDS,
+            ),
             headers=headers,
         )
     return _http_session
@@ -196,21 +208,87 @@ def truncate_response(text: str, limit: int) -> str:
     return cut.rstrip() + "…"
 
 
+class _LLMResponseError(Exception):
+    """The LLM server answered, but not with a usable completion.
+
+    Raised after logging the details; ``status_message`` is the short ⚠️
+    reply to post in Discord instead.
+    """
+
+    def __init__(self, status_message: str):
+        super().__init__(status_message)
+        self.status_message = status_message
+
+
+async def _read_event_stream(resp: aiohttp.ClientResponse) -> tuple[str, str | None]:
+    """Collect a streamed chat completion's text and final ``finish_reason``.
+
+    Reads OpenAI-style server-sent events: one ``data: {json}`` chunk per line,
+    ending with ``data: [DONE]``. Only ``delta.content`` is kept. Reasoning
+    sent separately (``delta.reasoning_content``) is discarded, but those
+    chunks, like SSE keep-alive comments, still reset the idle timeout.
+    """
+    parts: list[str] = []
+    finish_reason = None
+    async for raw_line in resp.content:
+        line = raw_line.strip()
+        if line.startswith(b"error:"):
+            # llama.cpp reports failures after streaming starts as an
+            # ``error`` event; OpenAI-style servers use an "error" data chunk.
+            log.error("API stream error: %s", line[:500].decode(errors="replace"))
+            raise _LLMResponseError(MSG_API_ERROR)
+        if not line.startswith(b"data:"):
+            continue  # Blank separators, ": keep-alive" comments, event/id fields.
+        data = line[5:].strip()
+        if data == b"[DONE]":
+            break
+        try:
+            chunk = json.loads(data)
+            if "error" in chunk:
+                log.error("API stream error: %r", chunk["error"])
+                raise _LLMResponseError(MSG_API_ERROR)
+            choices = chunk.get("choices")
+            if not choices:
+                continue  # Metadata, e.g. a trailing usage-only chunk.
+            choice = choices[0]
+            content = (choice.get("delta") or {}).get("content")
+            finish_reason = choice.get("finish_reason") or finish_reason
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+            log.error("Unexpected API stream chunk: %r", data[:500])
+            raise _LLMResponseError(MSG_API_UNEXPECTED) from None
+        if isinstance(content, str):
+            parts.append(content)
+    return "".join(parts), finish_reason
+
+
+def _read_json_completion(data) -> tuple[object, str | None]:
+    """Return a non-streamed completion's content and ``finish_reason``."""
+    try:
+        choice = data["choices"][0]
+        return choice["message"]["content"], choice.get("finish_reason")
+    except (KeyError, IndexError, TypeError):
+        log.error("Unexpected API response shape: %r", data)
+        raise _LLMResponseError(MSG_API_UNEXPECTED) from None
+
+
 async def query_llm(messages: list[dict]) -> str:
     """Send a chat completion request to the OpenAI-compatible API.
 
     ``messages`` is the conversation turns (user/assistant); the system prompt
-    is prepended here.
+    is prepended here. The reply is streamed so that the idle timeout only
+    fires when the server goes silent, not when a model is merely slow.
     """
     payload = {
         "model": MODEL_NAME,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *messages],
         "temperature": 0.7,
+        "stream": True,
     }
     if MAX_TOKENS:
         payload["max_tokens"] = MAX_TOKENS
     url = f"{API_BASE_URL.rstrip('/')}/chat/completions"
     log.info("POST %s  (%d message(s))", url, len(messages))
+    started = time.monotonic()
 
     try:
         session = await get_http_session()
@@ -220,35 +298,47 @@ async def query_llm(messages: list[dict]) -> str:
                 error_text = await resp.text()
                 log.error("API error body: %s", error_text[:500])
                 return MSG_API_ERROR
-            data = await resp.json(content_type=None)
-            try:
-                reply = data["choices"][0]["message"]["content"]
-            except (KeyError, IndexError, TypeError):
-                log.error("Unexpected API response shape: %r", data)
-                return MSG_API_UNEXPECTED
-            if not isinstance(reply, str) or not reply.strip():
-                log.error("LLM response was empty or non-text: %r", reply)
-                return MSG_API_EMPTY
-            answer = strip_reasoning(reply)
-            if not answer:
-                log.error(
-                    "LLM response contained only reasoning (%d chars); the model may "
-                    "have run out of tokens while thinking — raise or unset MAX_TOKENS.",
-                    len(reply),
-                )
-                return MSG_API_EMPTY
-            log.info("LLM reply: %d chars (%d after removing reasoning)", len(reply), len(answer))
-            if len(answer) > MAX_RESPONSE_CHARS:
-                log.info("Truncating reply to MAX_RESPONSE_CHARS=%d", MAX_RESPONSE_CHARS)
-                answer = truncate_response(answer, MAX_RESPONSE_CHARS)
-            return answer
+            if resp.content_type == "text/event-stream":
+                reply, finish_reason = await _read_event_stream(resp)
+            else:
+                # A server that ignores "stream" sends one ordinary JSON body.
+                data = await resp.json(content_type=None)
+                reply, finish_reason = _read_json_completion(data)
+        elapsed = time.monotonic() - started
+        if not isinstance(reply, str) or not reply.strip():
+            log.error(
+                "LLM response was empty or non-text after %.1fs (finish_reason=%s): %r",
+                elapsed, finish_reason, reply,
+            )
+            return MSG_API_EMPTY
+        answer = strip_reasoning(reply)
+        if not answer:
+            log.error(
+                "LLM response contained only reasoning (%d chars); the model may "
+                "have run out of tokens while thinking — raise or unset MAX_TOKENS.",
+                len(reply),
+            )
+            return MSG_API_EMPTY
+        log.info(
+            "LLM reply: %d chars (%d after removing reasoning) in %.1fs, finish_reason=%s",
+            len(reply), len(answer), elapsed, finish_reason,
+        )
+        if len(answer) > MAX_RESPONSE_CHARS:
+            log.info("Truncating reply to MAX_RESPONSE_CHARS=%d", MAX_RESPONSE_CHARS)
+            answer = truncate_response(answer, MAX_RESPONSE_CHARS)
+        return answer
+    except _LLMResponseError as e:
+        return e.status_message
     except aiohttp.ClientConnectorError as e:
         log.error("Cannot connect to LLM API at %s: %s", url, e)
         return MSG_API_UNREACHABLE
     except asyncio.TimeoutError:
-        # aiohttp's timeout errors subclass asyncio.TimeoutError. This is an
-        # expected condition with slow local models, so no traceback.
-        log.error("LLM API at %s did not respond within %ds.", url, API_TIMEOUT_SECONDS)
+        # aiohttp's connect and read timeouts subclass asyncio.TimeoutError.
+        # This means the server went silent, so log no traceback.
+        log.error(
+            "LLM API at %s sent nothing for %gs (%.0fs into the request).",
+            url, API_IDLE_TIMEOUT_SECONDS, time.monotonic() - started,
+        )
         return MSG_API_TIMEOUT
     except Exception as e:
         log.error("Unexpected error in query_llm: %s\n%s", e, traceback.format_exc())

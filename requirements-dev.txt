@@ -1,2 +1,4 @@
 -r requirements.txt
-coverage==7.16.2
+# coverage 7.17+ requires Python 3.11; 7.16.2 is the last release for 3.10.
+coverage==7.17.3; python_version >= "3.11"
+coverage==7.16.2; python_version < "3.11"

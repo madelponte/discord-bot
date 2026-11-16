@@ -66,8 +66,8 @@ DISCORD_TOKEN=test .venv/bin/python -c 'import bot'
 Key functions in `bot.py`:
 
 - `_int_env()` — validates integer environment variables.
-- `get_http_session()` — lazily creates the shared `aiohttp.ClientSession` with a 120-second timeout.
-- `query_llm()` — calls the configured chat-completions endpoint, validates its response, and strips inline reasoning.
+- `get_http_session()` — lazily creates the shared `aiohttp.ClientSession` with a 120-second idle timeout (`connect` and `sock_read`, no `total`).
+- `query_llm()` — calls the configured chat-completions endpoint with `"stream": true`, collects `delta.content` via `_read_event_stream()` (or `_read_json_completion()` for servers that ignore `stream`), and strips inline reasoning. Do not reintroduce a total timeout or non-streamed requests; that makes slow-but-working generations fail.
 - `truncate_response()` — shortens the final answer to `MAX_RESPONSE_CHARS` at a word boundary with an ellipsis.
 - `strip_reasoning()` — removes `<think>…</think>` blocks, a bare leading block closed by `</think>`, and unfinished `<think>` output.
 - `is_allowed_guild_member()` — checks and caches whether a DM author belongs to an allowed guild.
