@@ -68,9 +68,16 @@ queued and do not consume the user's cooldown. Limits are per process, not
 shared between separately deployed bot instances.
 
 HTTP calls use a single shared [aiohttp] session (created lazily, reused across
-requests) with a 120-second total timeout. Connection errors, timeouts, and API
-errors are caught and reported back to the channel as a short `⚠️` message
-instead of crashing. If the triggering message is deleted while the model is
+requests). Replies are requested with `"stream": true`, and the timeout is an
+**idle** timeout: a request fails only if the server sends nothing for 120
+seconds, whether while connecting, before the first token (queueing and prompt
+processing), or between tokens. A slow model that keeps producing tokens,
+including reasoning tokens, can take as long as it needs, so there is no overall
+time limit; set `MAX_TOKENS` if you want to bound generation. Servers that
+ignore `stream` and return a single JSON body are still supported. Connection
+errors, timeouts, and API errors (including errors reported mid-stream) are
+caught and reported back to the channel as a short `⚠️` message instead of
+crashing; partial output from a failed stream is discarded. If the triggering message is deleted while the model is
 generating, the response is still posted as a normal channel message.
 Internal URLs, exception details, and API error bodies are logged server-side
 but are never included in Discord replies.

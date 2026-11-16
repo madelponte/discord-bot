@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import runpy
 import signal
@@ -11,6 +12,8 @@ os.environ.setdefault("DISCORD_TOKEN", "test")
 
 import aiohttp
 import discord
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 import bot
 
@@ -250,10 +253,10 @@ class HttpSessionTests(unittest.IsolatedAsyncioTestCase):
             first.closed = True
             self.assertIs(await bot.get_http_session(), second)
         self.assertEqual(constructor.call_count, 2)
-        self.assertEqual(
-            constructor.call_args.kwargs["timeout"].total,
-            bot.API_TIMEOUT_SECONDS,
-        )
+        timeout = constructor.call_args.kwargs["timeout"]
+        self.assertIsNone(timeout.total)
+        self.assertEqual(timeout.connect, bot.API_IDLE_TIMEOUT_SECONDS)
+        self.assertEqual(timeout.sock_read, bot.API_IDLE_TIMEOUT_SECONDS)
         self.assertEqual(
             constructor.call_args.kwargs["headers"],
             {"Authorization": "Bearer secret-key"},
@@ -284,9 +287,12 @@ class HttpSessionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class QueryLlmTests(unittest.IsolatedAsyncioTestCase):
+    """Non-streamed (JSON body) replies, plus behaviour shared with streaming."""
+
     def response(self, *, status=200, data=None, text="error"):
         response = SimpleNamespace(
             status=status,
+            content_type="application/json",
             text=AsyncMock(return_value=text),
             json=AsyncMock(return_value=data),
         )
@@ -306,6 +312,7 @@ class QueryLlmTests(unittest.IsolatedAsyncioTestCase):
         payload = session.post.call_args.kwargs["json"]
         self.assertEqual(payload["model"], bot.MODEL_NAME)
         self.assertNotIn("max_tokens", payload)
+        self.assertIs(payload["stream"], True)
         self.assertEqual(payload["temperature"], 0.7)
         self.assertEqual(payload["messages"][1:], messages)
         response.json.assert_awaited_once_with(content_type=None)
@@ -399,6 +406,150 @@ class QueryLlmTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(bot, "get_http_session", AsyncMock(return_value=session)):
                     result = await bot.query_llm([])
                 self.assertEqual(result, bot.MSG_API_TIMEOUT)
+
+
+def sse(*events):
+    """Encode stream events as the raw lines aiohttp yields, blank line after each."""
+    lines = []
+    for event in events:
+        body = event if isinstance(event, bytes) else json.dumps(event).encode()
+        lines += [b"data: " + body + b"\n", b"\n"]
+    return lines
+
+
+def delta(content):
+    return {"choices": [{"index": 0, "delta": {"content": content}}]}
+
+
+class StreamingQueryLlmTests(unittest.IsolatedAsyncioTestCase):
+    """Server-sent-event replies, the normal path now that requests stream."""
+
+    async def query(self, lines, error=None):
+        async def content():
+            for line in lines:
+                yield line
+            if error is not None:
+                raise error
+
+        response = SimpleNamespace(status=200, content_type="text/event-stream", content=content())
+        session = SimpleNamespace(post=Mock(return_value=AsyncContextManager(response)))
+        with patch.object(bot, "get_http_session", AsyncMock(return_value=session)):
+            return await bot.query_llm([])
+
+    async def test_deltas_are_joined_and_non_content_events_ignored(self):
+        crlf = [line.replace(b"\n", b"\r\n") for line in sse(delta("Hel"))]
+        lines = [b": keep-alive\n", b"event: message\n"] + sse(
+            {"choices": [{"index": 0, "delta": {"role": "assistant"}}]},
+            {"choices": [{"index": 0, "delta": {"reasoning_content": "hmm"}}]},
+        ) + crlf + sse(
+            delta(None),
+            {"choices": [{"index": 0, "delta": {"content": "lo"}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "finish_reason": "stop"}]},
+            {"choices": [], "usage": {"completion_tokens": 3}},
+            {"timings": {}},
+            b"[DONE]",
+        ) + sse(delta(" after done"))
+        with self.assertLogs(bot.log, "INFO") as logs:
+            self.assertEqual(await self.query(lines), "Hello")
+        self.assertTrue(any("finish_reason=stop" in line for line in logs.output))
+
+    async def test_stream_without_done_marker_still_counts(self):
+        self.assertEqual(await self.query(sse(delta("answer"))), "answer")
+
+    async def test_reasoning_split_across_chunks_is_stripped_then_truncated(self):
+        chunks = ["<thi", "nk>long plan", "</thi", "nk>one two", " three four"]
+        with patch.object(bot, "MAX_RESPONSE_CHARS", 12):
+            result = await self.query(sse(*map(delta, chunks), b"[DONE]"))
+        self.assertEqual(result, "one two…")
+
+    async def test_stream_without_answer_text_is_empty(self):
+        cases = [
+            sse(b"[DONE]"),
+            sse({"choices": [{"index": 0, "delta": {"reasoning_content": "x"}, "finish_reason": "length"}]}),
+            sse(delta("<think>cut off by max_tokens")),
+        ]
+        for lines in cases:
+            with self.subTest(lines=lines):
+                self.assertEqual(await self.query(lines), bot.MSG_API_EMPTY)
+
+    async def test_error_events_report_an_api_error(self):
+        cases = [
+            sse(delta("partial")) + [b'error: {"code": 500, "message": "boom"}\n'],
+            sse(delta("partial"), {"error": {"message": "boom"}}),
+        ]
+        for lines in cases:
+            with self.subTest(lines=lines):
+                result = await self.query(lines)
+                self.assertEqual(result, bot.MSG_API_ERROR)
+                self.assertNotIn("boom", result)
+
+    async def test_malformed_chunks_report_an_unexpected_response(self):
+        for body in (b"{not json", b"\xff", b"5", b"[1]", b'{"choices": [null]}',
+                     b'{"choices": {"a": 1}}', b'{"choices": [{"delta": "x"}]}'):
+            with self.subTest(body=body):
+                result = await self.query(sse(delta("partial"), body))
+                self.assertEqual(result, bot.MSG_API_UNEXPECTED)
+
+    async def test_failures_mid_stream_discard_partial_text(self):
+        cases = {
+            aiohttp.SocketTimeoutError("Timeout on reading data from socket"): bot.MSG_API_TIMEOUT,
+            aiohttp.ClientPayloadError("Response payload is not completed"): bot.MSG_API_FAILED,
+        }
+        for error, expected in cases.items():
+            with self.subTest(error=error):
+                self.assertEqual(await self.query(sse(delta("partial")), error), expected)
+
+
+class StreamingIdleTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    """aiohttp's real timeouts against a local server that streams slowly."""
+
+    IDLE = 0.3
+
+    async def asyncSetUp(self):
+        self.stall_at = None
+        self.release = asyncio.Event()
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", self.chat_completions)
+        self.server = TestServer(app)
+        await self.server.start_server()
+        bot._http_session = None
+        for name, value in (
+            ("API_BASE_URL", str(self.server.make_url("/v1"))),
+            ("API_IDLE_TIMEOUT_SECONDS", self.IDLE),
+        ):
+            patcher = patch.object(bot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    async def asyncTearDown(self):
+        self.release.set()
+        await bot._close_http_session()
+        bot._http_session = None
+        await self.server.close()
+
+    async def chat_completions(self, request):
+        """Send 20 tokens 30ms apart (twice the idle timeout overall)."""
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        for i in range(20):
+            if i == self.stall_at:
+                await self.release.wait()  # Go silent until the test ends.
+                return response
+            await asyncio.sleep(0.03)
+            await response.write(b'data: {"choices": [{"delta": {"content": "x"}}]}\n\n')
+        await response.write(b"data: [DONE]\n\n")
+        return response
+
+    async def test_steady_stream_longer_than_idle_timeout_completes(self):
+        started = asyncio.get_running_loop().time()
+        self.assertEqual(await bot.query_llm([]), "x" * 20)
+        self.assertGreater(asyncio.get_running_loop().time() - started, self.IDLE)
+
+    async def test_silent_server_times_out(self):
+        for stall_at in (0, 5):  # Before any token, and mid-answer.
+            with self.subTest(stall_at=stall_at):
+                self.stall_at = stall_at
+                self.assertEqual(await bot.query_llm([]), bot.MSG_API_TIMEOUT)
 
 
 class MessageUtilityTests(unittest.TestCase):
